@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+
+# PyInstaller
+build/
+dist/
+*.spec
+
+# 应用输出
+SpectrumTagOutput/
+
+# 参考项目：单独克隆的 SpectrumTag 上游仓库，不属于本仓库的内容
+SpectrumTag/
