@@ -18,6 +18,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 from contextlib import contextmanager
 from typing import Iterator, Optional
@@ -70,13 +71,24 @@ def _verify(candidate: str) -> bool:
 
 
 def _bundled_candidate() -> Optional[str]:
-    here = os.path.dirname(os.path.abspath(__file__))
-    root = os.path.dirname(here)                       # spectrumtag_batch/
+    """随程序分发的 ffmpeg。
+
+    打包成 exe 后，PyInstaller 会把它解压到 ``sys._MEIPASS`` 下的 ``ffmpeg/``；
+    开发态则放在项目的 ``vendor/ffmpeg/`` 里。两处都找一遍。
+    """
     name = "ffmpeg.exe" if os.name == "nt" else "ffmpeg"
-    for sub in ("vendor/ffmpeg/bin", "vendor/ffmpeg"):
-        path = os.path.join(root, *sub.split("/"), name)
-        if os.path.isfile(path):
-            return path
+    roots: list[str] = []
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        roots.append(meipass)
+    here = os.path.dirname(os.path.abspath(__file__))
+    roots.append(os.path.dirname(here))                # spectrumtag_batch/
+
+    for root in roots:
+        for parts in (("ffmpeg",), ("vendor", "ffmpeg", "bin"), ("vendor", "ffmpeg")):
+            path = os.path.join(root, *parts, name)
+            if os.path.isfile(path):
+                return path
     return None
 
 

@@ -173,6 +173,30 @@ spectrumtag_batch/
 
 移植的等价性由自检中的**恒等性测试**守着：`amplitude_ratio = 1.0` 时增益恒为 1，整条链路应当无损重建。实测最大误差 `5.96e-08`，即 float32 的精度极限。
 
+## 打包成 exe
+
+```bash
+python -m PyInstaller build_exe.spec --noconfirm
+```
+
+产物是单个 `dist/频谱水印生成.exe`（约 130 MB），**ffmpeg 已包含在内**，
+拷到任意 Windows 机器上直接双击即可，无需安装 Python 或任何依赖。
+
+启动时会先显示启动画面（深色圆角卡片）：单文件模式需要先把内容解压到临时目录，
+这段时间由 PyInstaller 的 bootloader 画面顶着；Python 就绪后交给程序内的
+Qt 启动画面，两者用同一张图，交接处不留黑屏。
+
+### 打包配置里几个踩过的坑
+
+| 现象 | 原因 |
+| --- | --- |
+| 启动即崩，`No module named 'win32com'` | `qframelesswindow` 要用 pywin32 做窗口操作，不能排除 |
+| 弹 `could not find requirement _tk_data` | PyInstaller 的启动画面是 Tk 画的，`tkinter` 不能排除 |
+| 包体从 250 MB 涨到 900 MB | `collect_all` 会顺着依赖把 torch / onnxruntime / numba / pandas 全拖进来，改用 `collect_data_files` + `collect_dynamic_libs` |
+| 程序内那层启动画面找不到图 | 同一个文件名既给 EXE 的 `Splash` 又进 `datas` 时，只保留给 bootloader 的那份，需要换个名字 |
+
+排查启动问题时看 `%TEMP%\spectrumtag_startup.log`，它会记下卡在哪一步。
+
 ## 自检
 
 ```bash

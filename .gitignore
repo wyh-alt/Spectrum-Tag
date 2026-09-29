@@ -8,10 +8,10 @@ venv/
 .idea/
 .vscode/
 
-# PyInstaller
+# PyInstaller 的中间产物与输出。build_exe.spec 是构建配置，要提交，所以
+# 这里按目录排除而不是用 *.spec
 build/
 dist/
-*.spec
 
 # 应用输出
 SpectrumTagOutput/
