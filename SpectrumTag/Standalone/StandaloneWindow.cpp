@@ -1,0 +1,1258 @@
+#include "StandaloneWindow.h"
+#include <JuceHeader.h>
+#include <cmath>
+#include <memory>
+
+using namespace SharedColours;
+
+namespace
+{
+    constexpr int kDefaultWidth  = 1240;
+    constexpr int kDefaultHeight = 680;
+    constexpr int kMinWidth      = 800;
+    constexpr int kMinHeight     = 440;
+
+    constexpr int kFreqAxisWidth  = 70;
+    constexpr int kPianoWidth     = 28;
+    constexpr int kTimeAxisHeight = 24;
+
+    constexpr float kMinDisplayHz = FreqMap::kMinDisplayHz;
+    constexpr float kMaxDisplayHz = FreqMap::kMaxDisplayHz;
+
+    // 显示归一化：与插件一致，用窗口能量 √(∑w²) 归一化
+    inline float displayMagNormForWindow (const std::vector<float>& w, int N)
+    {
+        float s = 0.0f;
+        for (float v : w) s += v * v;
+        return s > 1e-12f ? 1.0f / std::sqrt (s) : 1.0f / (float) juce::jmax (1, N);
+    }
+}
+
+// ============================================================================
+//  StandaloneAudioSpectrogramView
+// ============================================================================
+StandaloneAudioSpectrogramView::StandaloneAudioSpectrogramView (juce::Typeface::Ptr tf)
+    : typeface (std::move (tf))
+{
+    imageBox = std::make_unique<ImageBoxComponent>();
+    imageBox->setTypeface (typeface);
+    addAndMakeVisible (*imageBox);
+    setInterceptsMouseClicks (true, true);
+}
+
+void StandaloneAudioSpectrogramView::resized()
+{
+    auto r = getLocalBounds();
+    axisBounds = r.removeFromLeft (kFreqAxisWidth);
+    timeAxisBounds = r.removeFromBottom (kTimeAxisHeight);
+    contentBounds = r;
+
+    if (imageBox != nullptr)
+        imageBox->setContentBounds (contentBounds);
+}
+
+void StandaloneAudioSpectrogramView::setAudio (const juce::AudioBuffer<float>& audio,
+                                                double sampleRate, int fftSize)
+{
+    currentAudio.makeCopyOf (audio);
+    currentSampleRate = sampleRate;
+    currentFftSize    = fftSize;
+    viewOffsetPx = 0.0f;
+    computeSpectrogramImage();
+    repaint();
+}
+
+void StandaloneAudioSpectrogramView::clearAudio()
+{
+    currentAudio.setSize (0, 0);
+    spectrogram = juce::Image();
+    spectrogramNativeWidth = 0;
+    spectrogramNativeHeight = 0;
+    viewOffsetPx = 0.0f;
+    repaint();
+}
+
+void StandaloneAudioSpectrogramView::rebuildSpectrogram (int fftSize)
+{
+    if (currentAudio.getNumSamples() <= 0) return;
+    currentFftSize = fftSize;
+    computeSpectrogramImage();
+    repaint();
+}
+
+std::pair<double, double> StandaloneAudioSpectrogramView::getImageBoxTimeRange() const
+{
+    // 图片框的归一化横向区间对应"当前视图窗口"里的可视比例；
+    // 而"当前视图窗口"又是整段时频图（时长 = duration）在 speed 拉伸/偏移下的一段。
+    //
+    // 换算逻辑：
+    //   - viewPixel = 图片框在 contentBounds 内的像素位置
+    //   - nativePixel = (viewPixel - viewOffsetPx) / horizontalStretch  (相对于原生时频图)
+    //   - timeSec = nativePixel / spectrogramNativeWidth * duration
+    if (contentBounds.isEmpty() || spectrogramNativeWidth <= 0)
+        return { 0.0, 0.0 };
+
+    const double duration = getAudioDurationSec();
+    if (duration <= 0.0) return { 0.0, 0.0 };
+
+    // 图片框在 content 内部的像素起止 X
+    const auto norm = imageBox->getNormalisedBounds();
+    const float viewX0 = norm.getX() * (float) contentBounds.getWidth();
+    const float viewX1 = (norm.getX() + norm.getWidth()) * (float) contentBounds.getWidth();
+
+    // View → Native 反变换
+    // 显示时: displayX = viewOffsetPx + nativeX * horizontalStretch
+    //   → nativeX = (displayX - viewOffsetPx) / horizontalStretch
+    // 我们在 paint 中 displayX 就是 viewX（viewX 是 content 内的相对坐标）
+    const float stretch = juce::jmax (0.001f, horizontalStretch);
+    const float nx0 = (viewX0 - viewOffsetPx) / stretch;
+    const float nx1 = (viewX1 - viewOffsetPx) / stretch;
+
+    const float w = (float) spectrogramNativeWidth;
+    double t0 = juce::jlimit (0.0, duration, (double) nx0 / (double) juce::jmax (1.0f, w) * duration);
+    double t1 = juce::jlimit (0.0, duration, (double) nx1 / (double) juce::jmax (1.0f, w) * duration);
+    if (t1 <= t0) t1 = juce::jmin (duration, t0 + 0.001);
+    return { t0, t1 };
+}
+
+float StandaloneAudioSpectrogramView::getImageBoxPixelWidth() const
+{
+    if (imageBox == nullptr) return 0.0f;
+    return (float) imageBox->getWidth();
+}
+
+// 一次性计算整段音频的时频图，宽度按"原生"策略选取（约 3px/帧）
+void StandaloneAudioSpectrogramView::computeSpectrogramImage()
+{
+    if (currentAudio.getNumSamples() <= 0 || currentSampleRate <= 0.0)
+    {
+        spectrogram = juce::Image();
+        spectrogramNativeWidth = 0;
+        spectrogramNativeHeight = 0;
+        return;
+    }
+
+    const int N = juce::jlimit (256, 32768, currentFftSize);
+    const int hop = N / 4;
+    const int numSamples = currentAudio.getNumSamples();
+    const int numFrames = juce::jmax (1, (numSamples - N) / hop + 1);
+
+    // 时频图目标像素高度：默认取 content 高度或 512（选大者），后续显示时按需拉伸
+    const int H = juce::jmax (256, contentBounds.getHeight() > 0 ? contentBounds.getHeight() : 512);
+    // 时频图目标像素宽度：直接 = 帧数，但 clamp 到合理区间避免超大图（同时也是"1x speed 时的宽度"）
+    const int nativeW = juce::jlimit (256, 32768, numFrames);
+
+    spectrogramNativeWidth  = nativeW;
+    spectrogramNativeHeight = H;
+
+    spectrogram = juce::Image (juce::Image::RGB, nativeW, H, true);
+    {
+        juce::Graphics g (spectrogram);
+        g.fillAll (kSpectrogramBgColour);
+    }
+
+    // 准备 FFT
+    const int order = (int) std::round (std::log2 ((double) N));
+    juce::dsp::FFT fft (order);
+
+    std::vector<float> window ((size_t) N);
+    for (int n = 0; n < N; ++n)
+        window[(size_t) n] = 0.5f * (1.0f - std::cos (juce::MathConstants<float>::twoPi
+                                                     * (float) n / (float) (N - 1)));
+    const float magNorm = displayMagNormForWindow (window, N);
+
+    std::vector<float> fftWork ((size_t) (2 * N), 0.0f);
+    std::vector<float> mono   ((size_t) N, 0.0f);
+    std::vector<float> mags   ((size_t) (N / 2 + 1), 0.0f);
+
+    const int numCh = currentAudio.getNumChannels();
+    const float invCh = 1.0f / (float) juce::jmax (1, numCh);
+    const float maxHz = (float) (currentSampleRate * 0.5);
+    const float dbFloor = -96.0f;
+
+    juce::Image::BitmapData bmp (spectrogram, juce::Image::BitmapData::readWrite);
+
+    for (int f = 0; f < nativeW; ++f)
+    {
+        // 该列对应的帧索引（如果 nativeW < numFrames，则线性插值取样；反之为帧本身）
+        const int frameIdx = juce::jlimit (0, numFrames - 1,
+                                            (int) ((int64_t) f * (int64_t) numFrames / juce::jmax (1, nativeW)));
+        const int start = frameIdx * hop;
+        for (int n = 0; n < N; ++n)
+        {
+            const int s = start + n;
+            float acc = 0.0f;
+            if (s < numSamples)
+            {
+                for (int ch = 0; ch < numCh; ++ch)
+                    acc += currentAudio.getReadPointer (ch)[s];
+                acc *= invCh;
+            }
+            mono[(size_t) n] = acc * window[(size_t) n];
+        }
+        std::copy (mono.begin(), mono.end(), fftWork.begin());
+        std::fill (fftWork.begin() + N, fftWork.end(), 0.0f);
+
+        fft.performRealOnlyForwardTransform (fftWork.data());
+
+        // DC
+        mags[0] = std::abs (fftWork[0]) * magNorm;
+        const int half = N / 2 + 1;
+        for (int k = 1; k < half - 1; ++k)
+        {
+            const float re = fftWork[(size_t) (2 * k)];
+            const float im = fftWork[(size_t) (2 * k + 1)];
+            mags[(size_t) k] = std::sqrt (re * re + im * im) * magNorm;
+        }
+        mags[(size_t) (half - 1)] = std::abs (fftWork[1]) * magNorm;
+
+        // 逐像素行绘制
+        const int numBins = half;
+        for (int y = 0; y < H; ++y)
+        {
+            const float yNorm = (float) y / juce::jmax (1, H - 1);
+            float hz;
+            if (scaleMode == 1) hz = FreqMap::yNormToFrequencyLog (yNorm, maxHz);
+            else                hz = FreqMap::yNormToFrequencyLinear (yNorm, maxHz);
+
+            const float binF = (hz / juce::jmax (1.0f, maxHz)) * (float) (numBins - 1);
+            const int b0 = juce::jlimit (0, numBins - 1, (int) std::floor (binF));
+            const int b1 = juce::jlimit (0, numBins - 1, b0 + 1);
+            const float t = juce::jlimit (0.0f, 1.0f, binF - (float) b0);
+            const float m = mags[(size_t) b0] + (mags[(size_t) b1] - mags[(size_t) b0]) * t;
+
+            const float db = juce::Decibels::gainToDecibels (juce::jmax (1e-9f, m));
+            const float dbNorm = juce::jlimit (0.0f, 1.0f, (db - dbFloor) / (-dbFloor));
+
+            const juce::Colour c = mapHeatmap (dbNorm);
+            bmp.setPixelColour (f, y, c);
+        }
+    }
+}
+
+juce::Colour StandaloneAudioSpectrogramView::mapHeatmap (float t)
+{
+    t = juce::jlimit (0.0f, 1.0f, t);
+    const juce::Colour c0 (0xff000000);
+    const juce::Colour c1 (0xff2a0a55);
+    const juce::Colour c2 (0xffd13a1a);
+    const juce::Colour c3 (0xfff8e83a);
+    if (t < 0.33f)      return c0.interpolatedWith (c1, t / 0.33f);
+    else if (t < 0.66f) return c1.interpolatedWith (c2, (t - 0.33f) / 0.33f);
+    else                return c2.interpolatedWith (c3, (t - 0.66f) / 0.34f);
+}
+
+void StandaloneAudioSpectrogramView::paint (juce::Graphics& g)
+{
+    drawFrequencyAxis (g);
+
+    g.setColour (kSpectrogramBgColour);
+    g.fillRect (contentBounds);
+
+    if (spectrogram.isValid() && spectrogramNativeWidth > 0)
+    {
+        // 显示：把 spectrogram（宽 nativeW × 高 H）以 horizontalStretch 缩放绘制到 contentBounds，
+        // 并加上 viewOffsetPx 的横向平移；纵向拉伸填满 content 高度。
+        g.saveState();
+        g.reduceClipRegion (contentBounds);
+
+        const float displayW = (float) spectrogramNativeWidth * horizontalStretch;
+        const float dstX = (float) contentBounds.getX() + viewOffsetPx;
+        const float dstY = (float) contentBounds.getY();
+        const float dstH = (float) contentBounds.getHeight();
+
+        g.drawImage (spectrogram,
+                     dstX, dstY, displayW, dstH,
+                     0, 0, spectrogramNativeWidth, spectrogramNativeHeight);
+        g.restoreState();
+    }
+
+    g.setColour (juce::Colour (0xff2a2d30));
+    g.drawRect (contentBounds, 1);
+
+    drawTimeAxis (g);
+}
+
+void StandaloneAudioSpectrogramView::drawFrequencyAxis (juce::Graphics& g)
+{
+    g.setColour (kAxisBgColour);
+    g.fillRect (axisBounds);
+
+    const float maxHz = juce::jmax (100.0f, (float) (currentSampleRate * 0.5));
+    juce::Font f = (typeface != nullptr) ? juce::Font (typeface) : juce::Font();
+    f = f.withHeight (10.0f);
+    g.setFont (f);
+    g.setColour (kAxisColour);
+
+    // 刻度文字矩形高度。最顶部（yNorm = 0）与最底部（yNorm = 1）两个刻度若直接按
+    // "y - 6" 起画，会有一半落在组件边界之外被裁掉 —— linear 模式下表现为
+    // 最上方的 22k 和最下方的 20 只能看到半行。这里把文字矩形夹进内容区范围。
+    constexpr int kLabelH = 12;
+    auto labelTopFor = [this, kLabelH] (int y)
+    {
+        const int top    = juce::jmax (0, contentBounds.getY());
+        const int bottom = juce::jmax (top, contentBounds.getBottom() - kLabelH);
+        return juce::jlimit (top, bottom, y - kLabelH / 2);
+    };
+
+    if (scaleMode == 1)
+    {
+        drawPianoKeys (g, maxHz);
+        const std::vector<float> hzMarks { 50, 100, 200, 500, 1000, 2000, 5000, 10000, 15000, 20000 };
+        const int textX = axisBounds.getRight() - 32;
+        for (auto hz : hzMarks)
+        {
+            if (hz > maxHz) continue;
+            const float yNorm = FreqMap::frequencyToYNormLog (hz, maxHz);
+            const int y = contentBounds.getY() + juce::roundToInt (yNorm * (contentBounds.getHeight() - 1));
+            juce::String label = (hz >= 1000.0f) ? (juce::String (hz / 1000.0f, 0) + "k")
+                                                 : juce::String ((int) hz);
+            g.drawText (label, textX, labelTopFor (y), 30, kLabelH, juce::Justification::centredRight);
+        }
+    }
+    else
+    {
+        const int N = 10;
+        for (int i = 0; i <= N; ++i)
+        {
+            const float yNorm = (float) i / (float) N;
+            const int y = contentBounds.getY() + juce::roundToInt (yNorm * (contentBounds.getHeight() - 1));
+            const float hz = FreqMap::yNormToFrequencyLinear (yNorm, maxHz);
+            juce::String label = (hz >= 1000.0f) ? (juce::String (hz / 1000.0f, hz >= 10000.0f ? 0 : 1) + "k")
+                                                 : juce::String ((int) std::round (hz));
+            g.drawText (label, axisBounds.getX() + 4, labelTopFor (y),
+                        axisBounds.getWidth() - 8, kLabelH, juce::Justification::centredRight);
+        }
+    }
+}
+
+void StandaloneAudioSpectrogramView::drawPianoKeys (juce::Graphics& g, float maxHz)
+{
+    const int kx = axisBounds.getX();
+    const int kw = kPianoWidth;
+    const int kytop = contentBounds.getY();
+    const int kyh   = contentBounds.getHeight();
+
+    auto noteToHz = [] (int midi) { return 440.0f * std::pow (2.0f, (midi - 69) / 12.0f); };
+    const int midiStart = 24;
+    const int midiEnd   = 120;
+
+    g.setColour (kPianoWhiteKey);
+    g.fillRect (kx, kytop, kw, kyh);
+
+    for (int m = midiStart; m <= midiEnd; ++m)
+    {
+        const float hz = noteToHz (m);
+        if (hz > maxHz) break;
+        const float yNorm = FreqMap::frequencyToYNormLog (hz, maxHz);
+        const int y = kytop + juce::roundToInt (yNorm * (kyh - 1));
+
+        const int pitchClass = m % 12;
+        const bool isBlack = (pitchClass == 1 || pitchClass == 3 || pitchClass == 6
+                              || pitchClass == 8 || pitchClass == 10);
+        if (isBlack)
+        {
+            g.setColour (kPianoBlackKey);
+            g.fillRect (kx, y - 1, juce::roundToInt (kw * 0.6f), 3);
+        }
+        else
+        {
+            g.setColour (juce::Colours::darkgrey);
+            g.drawLine ((float) kx, (float) y, (float) (kx + kw), (float) y, 0.5f);
+        }
+
+        if (pitchClass == 0)
+        {
+            g.setColour (juce::Colours::black);
+            juce::Font f = (typeface != nullptr) ? juce::Font (typeface) : juce::Font();
+            f = f.withHeight (9.0f);
+            g.setFont (f);
+            const int oct = m / 12 - 1;
+            g.drawText ("C" + juce::String (oct), kx + 2, y - 6, kw - 4, 12,
+                        juce::Justification::centredLeft);
+        }
+    }
+
+    g.setColour (juce::Colour (0xff555555));
+    g.drawRect (kx, kytop, kw, kyh, 1);
+}
+
+// 把 viewOffsetPx 限制在合法范围内（不允许拖到完全看不到时频图）
+void StandaloneAudioSpectrogramView::clampViewOffset()
+{
+    if (spectrogramNativeWidth <= 0 || contentBounds.isEmpty())
+    {
+        viewOffsetPx = 0.0f;
+        return;
+    }
+    const float displayW  = (float) spectrogramNativeWidth * horizontalStretch;
+    const float minOffset = juce::jmin (0.0f, (float) contentBounds.getWidth() - displayW);
+    viewOffsetPx = juce::jlimit (minOffset, 0.0f, viewOffsetPx);
+}
+
+// 绘制底部时间轴：刻度随当前视图窗口（Speed 缩放 / 拖动偏移）自适应
+void StandaloneAudioSpectrogramView::drawTimeAxis (juce::Graphics& g)
+{
+    g.saveState();
+    g.reduceClipRegion (timeAxisBounds);
+
+    g.setColour (kAxisBgColour);
+    g.fillRect (timeAxisBounds);
+
+    g.setColour (kAxisColour);
+    g.drawLine ((float) timeAxisBounds.getX(), (float) timeAxisBounds.getY(),
+                (float) timeAxisBounds.getRight(), (float) timeAxisBounds.getY(), 1.0f);
+
+    if (spectrogramNativeWidth > 0 && ! timeAxisBounds.isEmpty())
+    {
+        const double duration = getAudioDurationSec();
+        if (duration > 0.0)
+        {
+            // 当前视图窗口（contentBounds）覆盖的音频时间范围
+            const float stretch = juce::jmax (0.001f, horizontalStretch);
+            const float nx0 = (0.0f - viewOffsetPx) / stretch;
+            const float nx1 = ((float) contentBounds.getWidth() - viewOffsetPx) / stretch;
+            const float nw  = (float) spectrogramNativeWidth;
+            const double t0  = juce::jlimit (0.0, duration, (double) nx0 / (double) nw * duration);
+            const double t1  = juce::jlimit (0.0, duration, (double) nx1 / (double) nw * duration);
+
+            if (t1 > t0)
+            {
+                // 自适应刻度步进（1/2/5 × 10^k）
+                const double span = t1 - t0;
+                const double raw  = span / 5.0;
+                const double mag  = std::pow (10.0, std::floor (std::log10 (raw)));
+                const double norm = raw / mag;
+                double step = mag;
+                if      (norm >= 7.5) step = 10.0 * mag;
+                else if (norm >= 3.5) step = 5.0 * mag;
+                else if (norm >= 1.5) step = 2.0 * mag;
+
+                const double ax0 = (double) timeAxisBounds.getX();
+                const double axw = (double) timeAxisBounds.getWidth();
+                auto timeToX = [&] (double t) { return ax0 + (t - t0) / (t1 - t0) * axw; };
+
+                juce::Font f = (typeface != nullptr) ? juce::Font (typeface) : juce::Font();
+                f = f.withHeight (11.0f);
+                g.setFont (f);
+
+                for (double t = std::ceil (t0 / step) * step; t <= t1 + 1e-9; t += step)
+                {
+                    const float x = (float) timeToX (t);
+                    g.setColour (kAxisColour);
+                    g.drawLine (x, (float) timeAxisBounds.getY(),
+                                x, (float) timeAxisBounds.getY() + 4.0f);
+
+                    const int totalSec = (int) std::llround (t);
+                    const int mm = totalSec / 60;
+                    const int ss = totalSec % 60;
+                    const juce::String label = juce::String (mm) + ":" + juce::String (ss).paddedLeft ('0', 2);
+
+                    g.setColour (kTextSub);
+                    g.drawText (label, juce::roundToInt (x - 28.0f), timeAxisBounds.getY() + 4,
+                                56, timeAxisBounds.getHeight() - 6, juce::Justification::centredTop, false);
+                }
+            }
+        }
+    }
+
+    g.restoreState();
+}
+
+// ---- 鼠标滚轮：普通滚轮横向平移（等价拖动）；Ctrl+滚轮横向缩放（等价 Speed）----
+void StandaloneAudioSpectrogramView::mouseWheelMove (const juce::MouseEvent& e,
+                                                     const juce::MouseWheelDetails& wheel)
+{
+    if (spectrogramNativeWidth <= 0 || contentBounds.isEmpty()) return;
+
+    // 取纵向/横向中绝对值较大者，并统一方向（与 JUCE Slider 的写法一致）
+    float delta = (std::abs (wheel.deltaX) > std::abs (wheel.deltaY))
+                ? -wheel.deltaX : wheel.deltaY;
+    delta *= (wheel.isReversed ? -1.0f : 1.0f);
+
+    if (e.mods.isCtrlDown())
+    {
+        // 向上滚（delta>0）→ 放大；每 notch ±1.0 → ×1.1 / ÷1.1
+        const float factor = std::pow (1.1f, delta);
+        const float speed  = juce::jlimit (0.1f, 4.0f, horizontalStretch * factor);
+        setSpeed (speed);
+        if (onSpeedChanged) onSpeedChanged (speed);
+    }
+    else
+    {
+        // 向上滚（delta>0）→ 查看更晚的时间（等价向左拖动）
+        viewOffsetPx -= delta * 120.0f;
+        clampViewOffset();
+        repaint();
+    }
+}
+
+// ---- 鼠标横向拖动：只在频谱内容区（非图片框、非频率刻度）按下时启用 ----
+void StandaloneAudioSpectrogramView::mouseDown (const juce::MouseEvent& e)
+{
+    // 仅当点击落在 contentBounds 内（父视图坐标）时启用拖动
+    if (! contentBounds.contains (e.getPosition())) { dragging = false; return; }
+    dragging = true;
+    dragMoved = false;
+    dragStartX = e.getPosition().getX();
+    dragStartY = e.getPosition().getY();
+    dragStartOffsetPx = viewOffsetPx;
+    setMouseCursor (juce::MouseCursor::DraggingHandCursor);
+}
+
+void StandaloneAudioSpectrogramView::mouseDrag (const juce::MouseEvent& e)
+{
+    if (! dragging) return;
+    const int dx = e.getPosition().getX() - dragStartX;
+    const int dy = e.getPosition().getY() - dragStartY;
+    if (std::abs (dx) + std::abs (dy) > 3) dragMoved = true;
+
+    viewOffsetPx = dragStartOffsetPx + (float) dx;
+    clampViewOffset();
+
+    repaint();
+}
+
+void StandaloneAudioSpectrogramView::mouseUp (const juce::MouseEvent&)
+{
+    const bool wasClick = dragging && ! dragMoved;
+    dragging = false;
+    setMouseCursor (juce::MouseCursor::NormalCursor);
+
+    // 未发生拖动的“纯点击”：如果当前没有时频图，则触发回调（弹音频选择器）
+    // 如果已有时频图，不做任何事（避免意外弹窗）
+    if (wasClick && spectrogram.isNull() && onEmptyClicked)
+        onEmptyClicked();
+}
+
+// ============================================================================
+//  ExportResultOverlay —— 自定义导出结果弹窗（自绘，贴合深色主题）
+//   成功时提供 "Load new audio"（加载新导出的音频）与 "Close" 两个按钮；
+//   失败时只提供 "Close"。
+// ============================================================================
+class ExportResultOverlay : public juce::Component
+{
+public:
+    ExportResultOverlay (juce::Typeface::Ptr tf,
+                         const juce::File& file, bool ok,
+                         std::function<void()> onLoad, std::function<void()> onClose)
+        : outputFile (file),
+          success (ok),
+          onLoadCb (std::move (onLoad)),
+          onCloseCb (std::move (onClose)),
+          loadButton ("Load new audio", true),
+          closeButton ("Close", false)
+    {
+        typeface = std::move (tf);
+        setInterceptsMouseClicks (true, true);
+
+        loadButton.setTypeface (typeface);
+        closeButton.setTypeface (typeface);
+
+        loadButton.onClick  = [this] { if (onLoadCb)  onLoadCb(); };
+        closeButton.onClick = [this] { if (onCloseCb) onCloseCb(); };
+
+        addAndMakeVisible (loadButton);
+        addAndMakeVisible (closeButton);
+    }
+
+    void paint (juce::Graphics& g) override
+    {
+        // 半透明遮罩
+        g.fillAll (juce::Colours::black.withAlpha (0.55f));
+
+        auto card = cardBounds().toFloat();
+        g.setColour (SharedColours::kPanelColour);
+        g.fillRoundedRectangle (card, 12.0f);
+        g.setColour (juce::Colour (0xff3a3d40));
+        g.drawRoundedRectangle (card.reduced (0.5f), 12.0f, 1.0f);
+
+        auto content = cardBounds().reduced (24, 22);
+        auto title   = content.removeFromTop (34);
+        auto path    = content.removeFromTop (30);
+
+        juce::Font f = (typeface != nullptr) ? juce::Font (typeface) : juce::Font();
+        g.setFont (f.withHeight (20.0f));
+        g.setColour (SharedColours::kTextWhite);
+        g.drawText (success ? "Export complete" : "Export failed",
+                    title, juce::Justification::centred, false);
+
+        g.setFont (f.withHeight (13.0f));
+        g.setColour (SharedColours::kTextSub);
+        g.drawText (success ? outputFile.getFullPathName()
+                            : juce::String ("Could not write the output file."),
+                    path, juce::Justification::centred, false);
+    }
+
+    void resized() override
+    {
+        auto content = cardBounds().reduced (24, 22);
+        content.removeFromTop (34);          // 标题
+        content.removeFromTop (30);          // 路径
+        content.removeFromTop (18);          // 间距
+        auto btnRow = content.removeFromTop (40);
+
+        if (success)
+        {
+            const int gap = 12;
+            const int bw  = (btnRow.getWidth() - gap) / 2;
+            loadButton.setBounds (btnRow.removeFromLeft (bw));
+            btnRow.removeFromLeft (gap);
+            closeButton.setBounds (btnRow);
+            loadButton.setVisible (true);
+        }
+        else
+        {
+            const int bw = juce::jmin (200, btnRow.getWidth());
+            closeButton.setBounds (btnRow.withSizeKeepingCentre (bw, btnRow.getHeight()));
+            loadButton.setVisible (false);
+        }
+    }
+
+private:
+    juce::Rectangle<int> cardBounds() const
+    {
+        const int w = juce::jmax (260, juce::jmin (460, getWidth()  - 80));
+        const int h = juce::jmax (150, juce::jmin (200, getHeight() - 80));
+        return juce::Rectangle<int> (w, h).withCentre (getLocalBounds().getCentre());
+    }
+
+    juce::File            outputFile;
+    bool                  success = false;
+    std::function<void()> onLoadCb, onCloseCb;
+    FlatButton            loadButton, closeButton;
+    juce::Typeface::Ptr   typeface;
+};
+
+// ============================================================================
+//  RenderJob —— 后台离线渲染 + WAV 写盘
+// ============================================================================
+class SpectrumTagMainComponent::RenderJob : public juce::Thread
+{
+public:
+    RenderJob (SpectrumTagMainComponent& owner,
+               juce::AudioBuffer<float> input,
+               double sampleRate,
+               int bitsPerSample,
+               const juce::AudioChannelSet& channelSet,
+               OfflineRenderParams params,
+               std::vector<float> mask,
+               juce::File outputFile)
+        : juce::Thread ("SpectrumTag.RenderJob"),
+          ownerRef (owner),
+          input (std::move (input)),
+          sampleRate (sampleRate),
+          bitsPerSample (bitsPerSample),
+          channelSet (channelSet),
+          params (std::move (params)),
+          mask (std::move (mask)),
+          outputFile (std::move (outputFile))
+    {}
+
+    void run() override
+    {
+        ownerRef.renderRunning.store (true);
+        ownerRef.renderProgress.store (0.0f);
+
+        juce::AudioBuffer<float> output;
+        OfflineRenderer renderer;
+        auto progressCb = [this] (float p) -> bool
+        {
+            ownerRef.renderProgress.store (p);
+            return ! threadShouldExit();
+        };
+        const bool ok = renderer.render (input, output, sampleRate, params, mask, progressCb);
+
+        if (ok)
+        {
+            // 写 WAV
+            juce::WavAudioFormat wav;
+            outputFile.deleteFile();
+            std::unique_ptr<juce::FileOutputStream> os (outputFile.createOutputStream());
+            if (os != nullptr)
+            {
+                std::unique_ptr<juce::AudioFormatWriter> writer (wav.createWriterFor (
+                    os.get(),
+                    sampleRate,
+                    (unsigned int) output.getNumChannels(),
+                    juce::jlimit (16, 32, bitsPerSample),
+                    {},
+                    0));
+                if (writer != nullptr)
+                {
+                    os.release(); // writer 会接管所有权
+                    writer->writeFromAudioSampleBuffer (output, 0, output.getNumSamples());
+                    writer->flush();
+                    writer.reset(); // 关闭
+                    resultOk = true;
+                }
+            }
+        }
+
+        // 通知主线程（用自定义弹窗替代系统 AlertWindow）。
+        // 不要在异步闭包里按值捕获 this（RenderJob）：RenderJob 的释放时机由
+        // renderJob.reset() 控制，虽然当前流程能保证闭包先执行、job 后释放，但这是
+        // 脆弱的隐式依赖。这里把 outputFile 与 success 按值拷出，主组件按引用捕获
+        // （它拥有本 RenderJob，生命周期必然更长），彻底消除悬垂指针风险。
+        juce::MessageManager::callAsync (
+            [&owner = ownerRef, file = outputFile, success = (ok && resultOk)] ()
+            {
+                owner.renderRunning.store (false);
+                owner.showExportResult (file, success);
+            });
+    }
+
+private:
+    SpectrumTagMainComponent& ownerRef;
+    juce::AudioBuffer<float>  input;
+    double                    sampleRate;
+    int                       bitsPerSample;
+    juce::AudioChannelSet     channelSet;
+    OfflineRenderParams       params;
+    std::vector<float>        mask;
+    juce::File                outputFile;
+    bool                      resultOk = false;
+};
+
+// ============================================================================
+//  SpectrumTagMainComponent
+// ============================================================================
+SpectrumTagMainComponent::SpectrumTagMainComponent()
+{
+    formatManager.registerBasicFormats();   // WAV / AIFF / MP3 / FLAC / OGG (若 JUCE 启用)
+
+    basementTypeface = juce::Typeface::createSystemTypefaceFor (
+        BinaryData::BasementGrotesqueBlack_v1_202_otf,
+        BinaryData::BasementGrotesqueBlack_v1_202_otfSize);
+
+    setLookAndFeel (&lookAndFeel);
+
+    // ---- 顶部 ----
+    titleLabel.setText ("SpectrumTag", juce::dontSendNotification);
+    styleHeaderLabel (titleLabel, 32.0f, kTextWhite);
+    addAndMakeVisible (titleLabel);
+
+    versionLabel.setText (juce::String ("v") + ProjectInfo::versionString, juce::dontSendNotification);
+    styleHeaderLabel (versionLabel, 18.0f, kTextWhite);
+    addAndMakeVisible (versionLabel);
+
+    audioFileLabel.setJustificationType (juce::Justification::centredLeft);
+    audioFileLabel.setColour (juce::Label::textColourId, kTextSub);
+    audioFileLabel.setFont (juce::Font (basementTypeface).withHeight (13.0f));
+    audioFileLabel.setText ("Drop an audio file (WAV / MP3 / FLAC ...) to begin",
+                            juce::dontSendNotification);
+    addAndMakeVisible (audioFileLabel);
+
+    // ---- 频谱视图 ----
+    spectrumView = std::make_unique<StandaloneAudioSpectrogramView> (basementTypeface);
+    addAndMakeVisible (*spectrumView);
+
+    spectrumView->getImageBox().onChanged = [this] { repaint(); };
+    spectrumView->getImageBox().onImagePicked = [this] (const juce::File&)
+    {
+        repaint();
+        updateStatusLabel();
+    };
+    spectrumView->onEmptyClicked = [this] { pickAudioFile(); };
+    spectrumView->onSpeedChanged = [this] (float v)
+    {
+        speedSlider.setValue (v, juce::dontSendNotification);
+    };
+
+    // ---- 标签 ----
+    styleControlLabel (fftSizeLabel);
+    styleControlLabel (fftScaleLabel);
+    styleControlLabel (speedLabel);
+    styleControlLabel (amplitudeLabel);
+    styleControlLabel (invertLabel);
+    addAndMakeVisible (fftSizeLabel);
+    addAndMakeVisible (fftScaleLabel);
+    addAndMakeVisible (speedLabel);
+    addAndMakeVisible (amplitudeLabel);
+    addAndMakeVisible (invertLabel);
+
+    fftSizeCombo.addItemList ({ "1024", "2048", "4096", "8192" }, 1);
+    fftSizeCombo.setSelectedItemIndex (2, juce::dontSendNotification);   // 4096 默认
+    addAndMakeVisible (fftSizeCombo);
+    fftSizeCombo.onChange = [this]
+    {
+        const int idx = fftSizeCombo.getSelectedItemIndex();
+        const int N = (idx == 0 ? 1024 : idx == 1 ? 2048 : idx == 2 ? 4096 : 8192);
+        if (spectrumView != nullptr)
+            spectrumView->rebuildSpectrogram (N);
+    };
+
+    fftScaleCombo.addItemList ({ "linear", "mel" }, 1);
+    fftScaleCombo.setSelectedItemIndex (0, juce::dontSendNotification);
+    addAndMakeVisible (fftScaleCombo);
+    fftScaleCombo.onChange = [this]
+    {
+        if (spectrumView != nullptr)
+            spectrumView->setScaleMode (fftScaleCombo.getSelectedItemIndex());
+    };
+
+    speedSlider.setSliderStyle (juce::Slider::LinearHorizontal);
+    speedSlider.setTextBoxStyle (juce::Slider::NoTextBox, false, 0, 0);
+    speedSlider.setRange (0.1, 4.0, 0.0);
+    speedSlider.setSkewFactor (0.5);
+    speedSlider.setValue (1.0, juce::dontSendNotification);
+    speedSlider.onValueChange = [this]
+    {
+        if (spectrumView != nullptr)
+            spectrumView->setSpeed ((float) speedSlider.getValue());
+    };
+    addAndMakeVisible (speedSlider);
+
+    amplitudeSlider.setSliderStyle (juce::Slider::LinearHorizontal);
+    amplitudeSlider.setTextBoxStyle (juce::Slider::NoTextBox, false, 0, 0);
+    amplitudeSlider.setRange (0.0, 1.5, 0.0);
+    amplitudeSlider.setValue (0.0, juce::dontSendNotification);
+    addAndMakeVisible (amplitudeSlider);
+
+    invertToggle.setButtonText ({});
+    addAndMakeVisible (invertToggle);
+
+    printButton.setTypeface (basementTypeface);
+    printButton.onClick = [this] { onPrintClicked(); };
+    addAndMakeVisible (printButton);
+
+    // 窗口的可缩放性由 DocumentWindow（StandaloneMain.cpp）负责；这里只准备约束器
+    const double aspect = (double) kDefaultWidth / (double) kDefaultHeight;
+    resizeConstrainer.setFixedAspectRatio (aspect);
+    resizeConstrainer.setSizeLimits (kMinWidth, kMinHeight, 4096, 4096);
+    setSize (kDefaultWidth, kDefaultHeight);
+
+    updateStatusLabel();
+
+    startTimerHz (10);
+
+    telemetrySession = std::make_unique<iisaac::telemetry::Session> (
+        iisaac::telemetry::forStandalone ("spectrumtag", ProjectInfo::versionString,
+                                         ProjectInfo::versionString));
+}
+
+SpectrumTagMainComponent::~SpectrumTagMainComponent()
+{
+    telemetrySession.reset();
+    stopTimer();
+    if (renderJob != nullptr)
+    {
+        renderJob->stopThread (2000);
+        renderJob.reset();
+    }
+    setLookAndFeel (nullptr);
+}
+
+void SpectrumTagMainComponent::styleHeaderLabel (juce::Label& l, float h, juce::Colour c)
+{
+    l.setColour (juce::Label::textColourId, c);
+    l.setFont (juce::Font (basementTypeface).withHeight (h));
+    l.setJustificationType (juce::Justification::centredLeft);
+}
+
+void SpectrumTagMainComponent::styleControlLabel (juce::Label& l)
+{
+    l.setColour (juce::Label::textColourId, kTextWhite);
+    l.setFont (juce::Font (basementTypeface).withHeight (18.0f));
+    l.setJustificationType (juce::Justification::centredLeft);
+}
+
+void SpectrumTagMainComponent::paint (juce::Graphics& g)
+{
+    g.fillAll (kBgColour);
+}
+
+void SpectrumTagMainComponent::resized()
+{
+    const float scale = (float) getHeight() / (float) kDefaultHeight;
+    auto px = [scale] (int v) { return juce::roundToInt ((float) v * scale); };
+
+    auto r = getLocalBounds();
+
+    // 顶部
+    const int headerH = px (54);
+    auto header = r.removeFromTop (headerH).reduced (px (20), px (8));
+
+    titleLabel.setBounds (header.removeFromLeft (px (250)));
+    header.removeFromLeft (px (8));
+    versionLabel.setBounds (header.removeFromLeft (px (80)));
+    header.removeFromLeft (px (16));
+    audioFileLabel.setBounds (header);
+
+    titleLabel.setFont   (juce::Font (basementTypeface).withHeight (32.0f * scale));
+    versionLabel.setFont (juce::Font (basementTypeface).withHeight (18.0f * scale));
+    audioFileLabel.setFont (juce::Font (basementTypeface).withHeight (13.0f * scale));
+
+    // 主体
+    auto body = r.reduced (px (20), 0).withTrimmedBottom (px (20));
+    const int rightPanelW = px (280);
+    auto rightPanel = body.removeFromRight (rightPanelW);
+    body.removeFromRight (px (20));
+
+    if (spectrumView != nullptr)
+        spectrumView->setBounds (body);
+
+    const int labelH   = px (22);
+    const int comboH   = px (28);
+    const int sliderH  = px (18);
+    const int spacing  = px (10);
+    const int rowGap   = px (24);
+
+    auto controlFont = juce::Font (basementTypeface).withHeight (18.0f * scale);
+    fftSizeLabel.setFont (controlFont);
+    fftScaleLabel.setFont (controlFont);
+    speedLabel.setFont (controlFont);
+    amplitudeLabel.setFont (controlFont);
+    invertLabel.setFont (controlFont);
+
+    auto layoutSameLine = [&] (juce::Rectangle<int>& panel, juce::Label& lbl, juce::ComboBox& combo)
+    {
+        auto row = panel.removeFromTop (juce::jmax (labelH, comboH));
+        auto comboW = px (110);
+        combo.setBounds (row.removeFromRight (comboW).withSizeKeepingCentre (comboW, comboH));
+        lbl.setBounds (row);
+        panel.removeFromTop (rowGap);
+    };
+
+    layoutSameLine (rightPanel, fftSizeLabel,  fftSizeCombo);
+    layoutSameLine (rightPanel, fftScaleLabel, fftScaleCombo);
+
+    speedLabel.setBounds (rightPanel.removeFromTop (labelH));
+    rightPanel.removeFromTop (spacing);
+    speedSlider.setBounds (rightPanel.removeFromTop (sliderH));
+    rightPanel.removeFromTop (rowGap);
+
+    amplitudeLabel.setBounds (rightPanel.removeFromTop (labelH));
+    rightPanel.removeFromTop (spacing);
+    amplitudeSlider.setBounds (rightPanel.removeFromTop (sliderH));
+    rightPanel.removeFromTop (rowGap);
+
+    rightPanel.removeFromTop (px (20));
+
+    {
+        auto row = rightPanel.removeFromTop (px (28));
+        const int dotW = px (24);
+        invertToggle.setBounds (row.removeFromLeft (px (110) + dotW)
+                                   .withTrimmedLeft (px (110))
+                                   .withWidth (dotW));
+        invertLabel.setBounds (juce::Rectangle<int> (rightPanel.getX(),
+                                                      invertToggle.getY(),
+                                                      px (100),
+                                                      invertToggle.getHeight()));
+    }
+
+    const int printD = px (160);
+    auto printArea = juce::Rectangle<int> (
+        getWidth() - px (20) - printD,
+        getHeight() - px (20) - printD,
+        printD, printD);
+    printButton.setBounds (printArea);
+
+    // 弹窗覆盖层跟随窗口缩放
+    if (exportOverlay != nullptr)
+        exportOverlay->setBounds (getLocalBounds());
+}
+
+// ============================================================================
+//  文件拖入
+// ============================================================================
+bool SpectrumTagMainComponent::isInterestedInFileDrag (const juce::StringArray& files)
+{
+    for (auto& f : files)
+    {
+        const auto ext = juce::File (f).getFileExtension().toLowerCase();
+        if (ext == ".png" || ext == ".jpg" || ext == ".jpeg"
+            || ext == ".bmp" || ext == ".gif") return true;
+        if (ext == ".wav" || ext == ".mp3" || ext == ".flac"
+            || ext == ".aif" || ext == ".aiff" || ext == ".ogg") return true;
+    }
+    return false;
+}
+
+void SpectrumTagMainComponent::filesDropped (const juce::StringArray& files,
+                                              int /*x*/, int /*y*/)
+{
+    for (auto& f : files)
+    {
+        juce::File file (f);
+        if (! file.existsAsFile()) continue;
+        const auto ext = file.getFileExtension().toLowerCase();
+        if (ext == ".png" || ext == ".jpg" || ext == ".jpeg"
+            || ext == ".bmp" || ext == ".gif")
+        {
+            if (loadImage (file))
+                updateStatusLabel();
+        }
+        else if (ext == ".wav" || ext == ".mp3" || ext == ".flac"
+                 || ext == ".aif" || ext == ".aiff" || ext == ".ogg")
+        {
+            loadAudioFile (file);
+        }
+    }
+}
+
+void SpectrumTagMainComponent::fileDragEnter (const juce::StringArray&, int, int) {}
+void SpectrumTagMainComponent::fileDragExit  (const juce::StringArray&)         {}
+
+bool SpectrumTagMainComponent::loadImage (const juce::File& file)
+{
+    return spectrumView != nullptr
+        && spectrumView->getImageBox().loadImageFromFile (file);
+}
+
+// 显示自定义导出结果弹窗（主线程调用）
+void SpectrumTagMainComponent::showExportResult (const juce::File& file, bool ok)
+{
+    // 注意：不能在按钮的回调里同步 delete 掉 exportOverlay。onLoadCb 这个闭包
+    // 本身是作为 exportOverlay 的成员（std::function）被持有并正在执行的，
+    // 若在闭包内部直接 exportOverlay.reset()，会先把闭包（连同捕获的 file）析构，
+    // 之后再读 file 就变成 use-after-free：Windows 上碰巧不崩，macOS 上会
+    // SIGSEGV（strlen(NULL)）。因此把“关闭弹窗 + 加载音频”延后到消息循环的
+    // 下一次迭代，同时让 file 按值捕获到内层闭包，避免悬垂。
+    exportOverlay = std::make_unique<ExportResultOverlay> (
+        basementTypeface, file, ok,
+        [this, file]
+        {
+            juce::MessageManager::callAsync ([this, file]
+            {
+                exportOverlay.reset();
+                loadAudioFile (file);      // 加载新导出的音频
+            });
+        },
+        [this]
+        {
+            juce::MessageManager::callAsync ([this] { exportOverlay.reset(); });
+        });
+
+    exportOverlay->setBounds (getLocalBounds());
+    addAndMakeVisible (*exportOverlay);
+    exportOverlay->toFront (true);
+}
+
+// 弹出音频文件选择器（点击频谱空白区或未加载时点击 Print 会走到这里）
+void SpectrumTagMainComponent::pickAudioFile()
+{
+    auto chooser = std::make_shared<juce::FileChooser> (
+        "Select an audio file",
+        juce::File(),
+        "*.wav;*.mp3;*.flac;*.aif;*.aiff;*.ogg");
+
+    const int flags = juce::FileBrowserComponent::openMode
+                    | juce::FileBrowserComponent::canSelectFiles;
+
+    chooser->launchAsync (flags, [this, chooser] (const juce::FileChooser& fc)
+    {
+        auto f = fc.getResult();
+        if (f.existsAsFile())
+            loadAudioFile (f);
+    });
+}
+
+void SpectrumTagMainComponent::loadAudioFile (const juce::File& file)
+{
+    std::unique_ptr<juce::AudioFormatReader> reader (formatManager.createReaderFor (file));
+    if (reader == nullptr)
+    {
+        juce::AlertWindow::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
+            "SpectrumTag",
+            "Failed to open audio file:\n" + file.getFullPathName());
+        return;
+    }
+    const int64 total = reader->lengthInSamples;
+    if (total <= 0)
+    {
+        juce::AlertWindow::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
+            "SpectrumTag", "Audio file appears to be empty.");
+        return;
+    }
+    // 只读单声道或立体声：多声道也允许，但离线渲染按原通道数处理
+    const int numChannels = juce::jmax (1, (int) reader->numChannels);
+    juce::AudioBuffer<float> buffer (numChannels, (int) total);
+    reader->read (&buffer, 0, (int) total, 0, true, true);
+
+    currentAudio = std::move (buffer);
+    currentAudioFile = file;
+    currentSampleRate = reader->sampleRate;
+    currentBitsPerSample = juce::jlimit (16, 32, (int) reader->bitsPerSample > 0 ? (int) reader->bitsPerSample : 16);
+    currentFormatName = reader->getFormatName();
+    currentChannelLayout = juce::AudioChannelSet::canonicalChannelSet (numChannels);
+
+    updateStatusLabel();
+
+    if (spectrumView != nullptr)
+    {
+        const int idx = fftSizeCombo.getSelectedItemIndex();
+        const int N = (idx == 0 ? 1024 : idx == 1 ? 2048 : idx == 2 ? 4096 : 8192);
+        spectrumView->setAudio (currentAudio, currentSampleRate, N);
+    }
+}
+
+// ============================================================================
+//  顶部状态提示
+// ----------------------------------------------------------------------------
+//  三个状态：
+//   1) 已有音频        → 显示文件名 / 时长 / 采样率 / 声道数
+//   2) 有图片、无音频  → 高亮提示"下一步请拖入音频文件"（此时 Print 也不可用）
+//   3) 两者都没有      → 常规起始提示
+// ============================================================================
+void SpectrumTagMainComponent::updateStatusLabel()
+{
+    const bool hasAudio = currentAudio.getNumSamples() > 0;
+    const bool hasImage = spectrumView != nullptr && spectrumView->getImageBox().hasImage();
+
+    if (hasAudio)
+    {
+        audioFileLabel.setColour (juce::Label::textColourId, kTextSub);
+        audioFileLabel.setText ("Loaded: " + currentAudioFile.getFileName()
+            + juce::String::formatted ("   |   %.2f s   |   %.1f kHz   |   %d ch",
+                                       (double) currentAudio.getNumSamples() / currentSampleRate,
+                                       currentSampleRate / 1000.0,
+                                       currentAudio.getNumChannels()),
+            juce::dontSendNotification);
+        return;
+    }
+
+    if (hasImage)
+    {
+        // 图片已就位，缺的是音频：用高亮色把注意力引到"拖入音频"
+        audioFileLabel.setColour (juce::Label::textColourId, kImgBoxYellow);
+        audioFileLabel.setText ("Next: drop an audio file (WAV / MP3 / FLAC ...) here to continue",
+                                juce::dontSendNotification);
+        return;
+    }
+
+    audioFileLabel.setColour (juce::Label::textColourId, kTextSub);
+    audioFileLabel.setText ("Drop an audio file (WAV / MP3 / FLAC ...) to begin",
+                            juce::dontSendNotification);
+}
+
+// ============================================================================
+//  Print
+// ============================================================================
+void SpectrumTagMainComponent::onPrintClicked()
+{
+    if (renderRunning.load()) return;
+
+    // 没有音频：直接弹出音频选择器（而不是提示“请先拖入”）
+    if (spectrumView == nullptr || currentAudio.getNumSamples() <= 0)
+    {
+        pickAudioFile();
+        return;
+    }
+
+    auto& imgBox = spectrumView->getImageBox();
+    if (! imgBox.hasImage())
+    {
+        juce::AlertWindow::showMessageBoxAsync (juce::MessageBoxIconType::InfoIcon,
+            "SpectrumTag", "Please drop or click to load an image first.");
+        return;
+    }
+
+    // 弹出目录选择
+    auto chooser = std::make_shared<juce::FileChooser> (
+        "Select output directory",
+        currentAudioFile.getParentDirectory(),
+        juce::String());
+
+    const int flags = juce::FileBrowserComponent::openMode
+                    | juce::FileBrowserComponent::canSelectDirectories;
+
+    chooser->launchAsync (flags, [this, chooser] (const juce::FileChooser& fc)
+    {
+        auto dir = fc.getResult();
+        if (! dir.isDirectory()) return;
+
+        // 输出文件名：<原名>_tagged.wav；若已存在则加数字后缀
+        const juce::String baseName = currentAudioFile.getFileNameWithoutExtension() + "_tagged";
+        juce::File outFile = dir.getChildFile (baseName + ".wav");
+        int suffix = 1;
+        while (outFile.existsAsFile())
+        {
+            outFile = dir.getChildFile (baseName + "_" + juce::String (suffix) + ".wav");
+            ++suffix;
+        }
+
+        // 准备渲染参数
+        OfflineRenderParams params;
+        const int idx = fftSizeCombo.getSelectedItemIndex();
+        params.fftSize = (idx == 0 ? 1024 : idx == 1 ? 2048 : idx == 2 ? 4096 : 8192);
+        params.amplitudeRatio = (float) amplitudeSlider.getValue();
+        params.invert = invertToggle.getToggleState();
+
+        // 图片框 → 时间区间
+        auto [t0, t1] = spectrumView->getImageBoxTimeRange();
+        params.startSec = t0;
+        params.endSec   = t1;
+
+        // 图片框 → 频率区间（用其归一化 Y 反推）
+        // 与插件 UI 一致：normRect y=0 = 顶部 = 高频；y=1 = 底部 = 低频
+        const auto normR = spectrumView->getImageBox().getNormalisedBounds();
+        const float maxHz = (float) (currentSampleRate * 0.5);
+        const int scaleMode = fftScaleCombo.getSelectedItemIndex();
+        auto yNormToFreq = [&] (float y)
+        {
+            return scaleMode == 1
+                ? FreqMap::yNormToFrequencyLog (y, maxHz)
+                : FreqMap::yNormToFrequencyLinear (y, maxHz);
+        };
+        const float fTop = yNormToFreq (normR.getY());
+        const float fBot = yNormToFreq (normR.getBottom());
+        const float fLow  = juce::jmin (fTop, fBot);
+        const float fHigh = juce::jmax (fTop, fBot);
+        params.freqLowNorm  = juce::jlimit (0.0f, 1.0f, fLow  / juce::jmax (1.0f, maxHz));
+        params.freqHighNorm = juce::jlimit (0.0f, 1.0f, fHigh / juce::jmax (1.0f, maxHz));
+
+        // mask
+        const int rows = params.fftSize / 2 + 1;
+        const int cols = computeMaskCols (spectrumView->getImageBoxPixelWidth());
+        params.maskRows = rows;
+        params.maskCols = cols;
+        auto mask = spectrumView->getImageBox().generateMask (rows, cols);
+
+        // 检查区间有效性
+        if (params.endSec <= params.startSec + 0.01)
+        {
+            juce::AlertWindow::showMessageBoxAsync (juce::MessageBoxIconType::WarningIcon,
+                "SpectrumTag",
+                "The image box covers a too-short time range.\nPlease move or enlarge the image box on the spectrum.");
+            return;
+        }
+
+        // 启动后台渲染
+        renderProgress.store (0.0f);
+        printButton.setEnabled (false);
+
+        renderJob = std::make_unique<RenderJob> (
+            *this,
+            currentAudio,
+            currentSampleRate,
+            currentBitsPerSample,
+            currentChannelLayout,
+            params,
+            std::move (mask),
+            outFile);
+        renderJob->startThread();
+    });
+}
+
+void SpectrumTagMainComponent::timerCallback()
+{
+    // 更新按钮状态
+    const bool running = renderRunning.load();
+    if (! running && ! printButton.isEnabled())
+        printButton.setEnabled (true);
+
+    // 显示进度
+    if (running)
+    {
+        const int pct = juce::jlimit (0, 100, (int) std::round (renderProgress.load() * 100.0f));
+        audioFileLabel.setText ("Rendering... " + juce::String (pct) + "%",
+                                juce::dontSendNotification);
+    }
+    else if (renderJob != nullptr && ! renderJob->isThreadRunning())
+    {
+        // 清理已完成的 job，并把状态提示恢复到"已载入音频"
+        renderJob.reset();
+        updateStatusLabel();
+    }
+}

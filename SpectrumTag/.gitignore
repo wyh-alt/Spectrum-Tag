@@ -1,0 +1,54 @@
+# Build directories
+cmake-build-*/
+build/
+Builds/
+dist/
+Log/
+
+# IDE files
+.idea/
+.vscode/
+.codebuddy/
+*.swp
+*.swo
+*~
+
+# Visual Studio
+*.suo
+*.user
+*.sln.docstates
+.vs/
+
+# CMake
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+install_manifest.txt
+Makefile
+
+# JUCE generated files
+JuceLibraryCode/
+juce_*_Artefacts/
+.gradle/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Binary files
+*.exe
+*.dll
+*.so
+*.dylib
+*.vst3
+*.component
+*.app
+
+# Test assets (large audio/render fixtures, keep out of repo)
+test/
+*.wav
+*.pkf
+
+# Temporary files
+*.log
+*.tmp

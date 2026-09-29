@@ -16,5 +16,8 @@ dist/
 # 应用输出
 SpectrumTagOutput/
 
-# 参考项目：单独克隆的 SpectrumTag 上游仓库，不属于本仓库的内容
-SpectrumTag/
+# 说明：SpectrumTag/ 是随仓库一起分发的参考实现（已去掉它的 .git，
+# 以便异地克隆后能直接看到源码）。它自己的构建产物仍然排除在外。
+SpectrumTag/cmake-build-*/
+SpectrumTag/build/
+SpectrumTag/dist/
