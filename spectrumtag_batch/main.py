@@ -189,6 +189,7 @@ def main() -> int:
     if splash is not None and remaining > 0:
         time.sleep(remaining)
 
+    _center_on_screen(window)
     _log_startup("准备 show()")
     window.show()
     _log_startup(
@@ -200,6 +201,25 @@ def main() -> int:
         _log_startup("启动画面已收起")
     _log_startup("进入事件循环")
     return app.exec()
+
+
+def _center_on_screen(window) -> None:
+    """把主窗口摆到屏幕正中。
+
+    Qt 默认让窗口管理器决定初始位置，多屏或某些 Windows 配置下会落到右下角，
+    看着像没摆正。这里显式居中，用的是"可用区域"（已扣掉任务栏）而不是整块屏幕。
+    """
+    from PyQt6.QtWidgets import QApplication
+
+    screen = window.screen() or QApplication.primaryScreen()
+    if screen is None:
+        return
+    area = screen.availableGeometry()
+    size = window.size()
+    window.move(
+        area.x() + max(0, (area.width() - size.width()) // 2),
+        area.y() + max(0, (area.height() - size.height()) // 2),
+    )
 
 
 def _build_splash(splash_cls, pixmap_cls, color_cls, qt):

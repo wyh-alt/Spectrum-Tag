@@ -777,6 +777,17 @@ def main() -> int:
         # 贴边：只够放刻度文字，不留多余空隙
         check(f"边距贴边（{left_w:.0f}px）", left_w <= 28)
 
+    def step_window_center() -> None:
+        """主窗口应当摆在屏幕正中，而不是交给窗口管理器随便放。"""
+        from ..main import _center_on_screen
+
+        _center_on_screen(window)
+        screen = QApplication.primaryScreen().availableGeometry()
+        expect_x = screen.x() + max(0, (screen.width() - window.width()) // 2)
+        expect_y = screen.y() + max(0, (screen.height() - window.height()) // 2)
+        check(f"主窗口居中（({window.x()}, {window.y()})）",
+              (window.x(), window.y()) == (expect_x, expect_y))
+
     def step_output_options() -> None:
         """高级参数里的输出选项：合成视频开关 + 两种容器格式。"""
         from ..core.params import AudioFormat, VideoFormat
@@ -860,7 +871,8 @@ def main() -> int:
         step_engraving_mode, step_mode_advice, step_text_multiline_and_dblclick,
         step_drag_spinbox,
         step_sensitive_band, step_roi_handles, step_drop_files,
-        step_axis_units, step_output_options, step_action_buttons,
+        step_axis_units, step_window_center, step_output_options,
+        step_action_buttons,
     ]
 
     def run_next() -> None:
