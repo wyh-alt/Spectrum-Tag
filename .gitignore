@@ -16,6 +16,9 @@ dist/
 # 应用输出
 SpectrumTagOutput/
 
+# 提交信息草稿（绕开 PowerShell 多行参数用的临时文件）
+commit_msg.txt
+
 # 说明：SpectrumTag/ 是随仓库一起分发的参考实现（已去掉它的 .git，
 # 以便异地克隆后能直接看到源码）。它自己的构建产物仍然排除在外。
 SpectrumTag/cmake-build-*/
