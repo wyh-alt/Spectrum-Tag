@@ -174,14 +174,18 @@ def main() -> int:
     started = time.monotonic()
     splash = _build_splash(QSplashScreen, QPixmap, QColor, Qt)
     _log_startup(f"Qt 启动画面: {'已显示' if splash else '未创建'}")
+    _advance_splash(splash, 0.12, "正在加载界面模块…", app)
     _release_pyi_splash()
 
     _log_startup("开始导入主窗口模块")
     from .ui.main_window import MainWindow
 
     _log_startup("主窗口模块已导入，开始构建")
+    _advance_splash(splash, 0.5, "正在构建频谱视图…", app)
+
     window = MainWindow()
     _log_startup("主窗口构建完成")
+    _advance_splash(splash, 0.92, "即将就绪…", app)
     if icon_path:
         window.setWindowIcon(QIcon(icon_path))
 
@@ -225,7 +229,10 @@ def _center_on_screen(window) -> None:
 def _build_splash(splash_cls, pixmap_cls, color_cls, qt):
     """搭出 Qt 这一层的启动画面；图缺失就返回 None，不影响启动。
 
-    打包态读 ``splash_ui.png``（spec 里给 datas 起的名字），开发态直接读源文件。
+    底图（spec 里叫 ``splash_ui.png``）已经画好 logo、标题、描述和进度槽，
+    这里只往上叠进度与当前加载项 —— 那两样是动态的，进不了静态图。
+
+    打包态读改名后的图，开发态直接读源文件。
     """
     path = _resource_path("splash_ui.png") or _resource_path("splash.png")
     if not path:
@@ -234,18 +241,62 @@ def _build_splash(splash_cls, pixmap_cls, color_cls, qt):
     if pixmap.isNull():
         return None
 
-    splash = splash_cls(pixmap)
-    # 图片是圆角的，去掉窗口背景才不会有方块底
-    splash.setAttribute(qt.WidgetAttribute.WA_TranslucentBackground)
-    splash.showMessage(
-        "正在加载界面…",
-        qt.AlignmentFlag.AlignBottom | qt.AlignmentFlag.AlignRight,
-        color_cls(150, 150, 162),
-    )
+    class _StartupSplash(splash_cls):
+        """带进度条和当前加载项的启动画面。"""
+
+        # 与底图里画好的元素对齐
+        _MARGIN = 30
+        _TRACK_Y = 120
+        _TRACK_H = 4
+        _STAGE_Y = 132
+
+        def __init__(self, pix):
+            super().__init__(pix)
+            self._progress = 0.0
+            self._stage = "正在启动…"
+            # 底图是圆角的，去掉窗口背景才不会有方块底
+            self.setAttribute(qt.WidgetAttribute.WA_TranslucentBackground)
+
+        def set_progress(self, value: float, stage: str) -> None:
+            self._progress = max(0.0, min(1.0, float(value)))
+            self._stage = stage
+            self.repaint()
+
+        def drawContents(self, painter) -> None:
+            super().drawContents(painter)
+            left = self._MARGIN
+            right = self.width() - self._MARGIN
+
+            # 进度：底槽由底图提供，这里只画已经走完的那一段
+            filled = left + int((right - left) * self._progress)
+            if filled > left:
+                painter.setPen(qt.PenStyle.NoPen)
+                painter.setBrush(color_cls(0, 178, 179))
+                painter.drawRoundedRect(
+                    left, self._TRACK_Y, filled - left, self._TRACK_H, 2, 2
+                )
+
+            painter.setPen(color_cls(130, 130, 142))
+            painter.drawText(
+                left, self._STAGE_Y, right - left, 16,
+                qt.AlignmentFlag.AlignLeft, self._stage,
+            )
+
+    splash = _StartupSplash(pixmap)
     splash.show()
-    # 立刻处理一轮事件，让画面先画出来再去干后面那些耗时的初始化
     splash.repaint()
     return splash
+
+
+def _advance_splash(splash, value: float, stage: str, app) -> None:
+    """推进启动画面。
+
+    顺手跑一轮事件 —— 不跑的话画面只是改了数据，屏幕上还是上一帧。
+    """
+    if splash is None:
+        return
+    splash.set_progress(value, stage)
+    app.processEvents()
 
 
 if __name__ == "__main__":
