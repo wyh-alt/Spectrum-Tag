@@ -778,7 +778,11 @@ def main() -> int:
         check(f"边距贴边（{left_w:.0f}px）", left_w <= 28)
 
     def step_window_center() -> None:
-        """主窗口应当摆在屏幕正中，而不是交给窗口管理器随便放。"""
+        """主窗口应当摆在**主屏**正中，而不是交给窗口管理器随便放。
+
+        期望值用 primaryScreen 算，与实现保持一致 —— 多屏环境下
+        ``window.screen()`` 可能指向副屏，拿它算会得出错误的位置。
+        """
         from ..main import _center_on_screen
 
         _center_on_screen(window)

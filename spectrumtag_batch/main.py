@@ -208,14 +208,18 @@ def main() -> int:
 
 
 def _center_on_screen(window) -> None:
-    """把主窗口摆到屏幕正中。
+    """把主窗口摆到主屏正中。
 
-    Qt 默认让窗口管理器决定初始位置，多屏或某些 Windows 配置下会落到右下角，
-    看着像没摆正。这里显式居中，用的是"可用区域"（已扣掉任务栏）而不是整块屏幕。
+    Qt 默认让窗口管理器决定初始位置，多屏或某些 Windows 配置下会落到右下角。
+
+    这里固定用主屏，而不是 ``window.screen()``：窗口刚建出来时位置还没定，
+    跟着"当前所在屏"走会落到哪块屏全看窗口管理器的心情 —— 实测多屏环境下
+    它可能指到左边那块副屏（x 为负），结果窗口跑到屏幕外。
+    用的是"可用区域"（已扣掉任务栏）而不是整块屏幕。
     """
     from PyQt6.QtWidgets import QApplication
 
-    screen = window.screen() or QApplication.primaryScreen()
+    screen = QApplication.primaryScreen()
     if screen is None:
         return
     area = screen.availableGeometry()
