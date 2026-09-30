@@ -778,15 +778,32 @@ def main() -> int:
         check(f"边距贴边（{left_w:.0f}px）", left_w <= 28)
 
     def step_window_center() -> None:
-        """主窗口应当摆在**主屏**正中，而不是交给窗口管理器随便放。
+        """主窗口要有正确的默认尺寸，并摆在**主屏**正中。
 
-        期望值用 primaryScreen 算，与实现保持一致 —— 多屏环境下
+        尺寸这条曾经悄悄失效过：FluentWindow 的延迟初始化会把在 show() 之前
+        设的尺寸重置成 Qt 默认的 500x500，结果窗口顶着最小尺寸打开、右侧参数
+        被挤得显示不全。
+
+        期望位置用 primaryScreen 算，与实现保持一致 —— 多屏环境下
         ``window.screen()`` 可能指向副屏，拿它算会得出错误的位置。
         """
         from ..main import _center_on_screen
 
-        _center_on_screen(window)
         screen = QApplication.primaryScreen().availableGeometry()
+        window.apply_default_size()
+        QApplication.processEvents()
+
+        scale = min(
+            1.0, screen.width() * 0.92 / 1440, screen.height() * 0.92 / 940
+        )
+        expect_w = int(1440 * scale) if scale < 1.0 else 1440
+        expect_h = int(940 * scale) if scale < 1.0 else 940
+        check(f"窗口为默认尺寸（{window.width()}x{window.height()}）",
+              (window.width(), window.height()) == (expect_w, expect_h))
+        check(f"宽高比未失真（{window.width() / window.height():.3f}）",
+              abs(window.width() / window.height() - 1440 / 940) < 0.01)
+
+        _center_on_screen(window)
         expect_x = screen.x() + max(0, (screen.width() - window.width()) // 2)
         expect_y = screen.y() + max(0, (screen.height() - window.height()) // 2)
         check(f"主窗口居中（({window.x()}, {window.y()})）",

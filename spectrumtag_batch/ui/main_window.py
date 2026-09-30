@@ -11,6 +11,7 @@ import numpy as np
 from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QFileDialog,
     QFrame,
     QHBoxLayout,
@@ -1329,8 +1330,7 @@ class MainWindow(FluentWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("频谱水印生成")
-        self.resize(1440, 940)
-        self.setMinimumSize(1120, 720)
+        # 尺寸不在这里设 —— 见 apply_default_size()，它必须等窗口显示之后才生效
 
         self.batch_page = BatchPage(self)
         self.help_page = HelpPage(self)
@@ -1339,6 +1339,31 @@ class MainWindow(FluentWindow):
         self.addSubInterface(self.help_page, FluentIcon.HELP, "使用说明")
 
         self.navigationInterface.setExpandWidth(180)
+
+    def apply_default_size(self) -> None:
+        """设成默认窗口尺寸；屏幕装不下时**等比**收窄。
+
+        必须在 ``show()`` **之后**调用。FluentWindow 的初始化里有延迟执行的
+        部分，会在事件循环第一次转动时把窗口尺寸重置成 Qt 的默认值
+        （500x500）—— 在那之前调的 ``resize()`` 全都会被它盖掉，实测延迟一帧
+        也没用，只有显示之后再设才留得住。
+
+        收窄要等比，宽高各自受限会导致比例失真 —— 高 DPI 缩放或小屏都会撞上。
+        """
+        width, height = 1440, 940
+        screen = QApplication.primaryScreen()
+        if screen is not None:
+            area = screen.availableGeometry()
+            scale = min(
+                1.0,
+                area.width() * 0.92 / width,
+                area.height() * 0.92 / height,
+            )
+            if scale < 1.0:
+                width, height = int(width * scale), int(height * scale)
+        # 最小尺寸也跟着收，否则窄屏上会被它顶回去
+        self.setMinimumSize(min(1120, width), min(720, height))
+        self.resize(width, height)
 
     def closeEvent(self, event) -> None:  # noqa: N802
         worker = self.batch_page._batch_worker  # noqa: SLF001 - 关闭前先收尾后台任务

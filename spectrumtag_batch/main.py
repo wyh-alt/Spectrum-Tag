@@ -193,9 +193,18 @@ def main() -> int:
     if splash is not None and remaining > 0:
         time.sleep(remaining)
 
-    _center_on_screen(window)
+    screen = QApplication.primaryScreen()
+    _log_startup(
+        f"屏幕可用区域={screen.availableGeometry().getRect() if screen else '未知'}  "
+        f"窗口={window.width()}x{window.height()}"
+    )
     _log_startup("准备 show()")
     window.show()
+    # 尺寸与位置都必须在 show() 之后再定：FluentWindow 的延迟初始化会在事件
+    # 循环第一次转动时把尺寸重置成默认值，之前设的留不住（详见 apply_default_size）
+    app.processEvents()
+    window.apply_default_size()
+    _center_on_screen(window)
     _log_startup(
         f"show() 完成 isVisible={window.isVisible()} "
         f"size={window.width()}x{window.height()}"
