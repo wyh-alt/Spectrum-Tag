@@ -24,6 +24,11 @@ from PyQt6.QtWidgets import (
 from qfluentwidgets import BodyLabel
 
 from ..core.dsp import hann_window
+from ..core.params import (
+    DEFAULT_CUT_STRENGTH,
+    DRAW_LEVEL_MAX_DBFS,
+    DRAW_LEVEL_MIN_DBFS,
+)
 
 # 印水印最容易影响听感的频率范围，写成"段的列表"是为了将来能拆成几段，
 # 目前就是连续的一段。
@@ -49,8 +54,14 @@ _INLINE_EDIT_HEIGHT = 64
 # "无限制"就是一直印到音频结束，跟这个数没有关系。
 # 定得足够宽，正常素材碰不到；真碰到了也只是少画几个影子，不影响导出结果。
 _MAX_LOOP_GHOSTS = 96
-# 影子比第一个框淡，一眼就能分出"可调的那个"和"跟着循环的"
-_LOOP_GHOST_OPACITY = 0.42
+
+# 叠加图案的不透明度区间：强度 0 时淡到几乎只剩个轮廓（确实也没什么效果），
+# 强度 1 时最实。第一个框和循环影子用同一套，看起来才是一回事。
+_OVERLAY_ALPHA_MIN = 32
+_OVERLAY_ALPHA_MAX = 215
+
+# 衰减模式预览用的暗色 —— 那一片的能量会被抹掉，在图上就是塌下去
+_OVERLAY_CUT_RGB = (14, 12, 20)
 
 # 时频图的显示区间（dBFS）：0 = 满量程。用绝对参考而不是相对峰值，
 # 否则噪声类素材会把整个画面刷成同一种亮色。
@@ -113,26 +124,59 @@ def _freq_tick_strings(values, scale, _spacing) -> list[str]:
     return labels
 
 
-def _build_overlay_lut(dark: bool = False) -> np.ndarray:
+def _heat_color_at(norm: float) -> tuple[int, int, int]:
+    """从时频图的热力色标上取某个位置的颜色（输入 0~1，输出 0~255）。"""
+    norm = max(0.0, min(1.0, norm))
+    stops = _HEAT_STOPS
+    for index in range(len(stops) - 1):
+        p0, r0, g0, b0 = stops[index]
+        p1, r1, g1, b1 = stops[index + 1]
+        if p0 <= norm <= p1:
+            t = (norm - p0) / max(1e-9, p1 - p0)
+            return (
+                int(round((r0 + (r1 - r0) * t) * 255)),
+                int(round((g0 + (g1 - g0) * t) * 255)),
+                int(round((b0 + (b1 - b0) * t) * 255)),
+            )
+    return (0, 0, 0)
+
+
+def _draw_level_norm(strength: float) -> float:
+    """把注入强度换算到频谱显示范围里的归一化位置。
+
+    注入强度本就对应一个 dBFS 目标电平（见 params.DRAW_LEVEL_*），
+    再按显示区间映射一下，就是它在热力图上的亮度位置。
+    """
+    dbfs = DRAW_LEVEL_MIN_DBFS + (
+        DRAW_LEVEL_MAX_DBFS - DRAW_LEVEL_MIN_DBFS
+    ) * max(0.0, min(1.0, strength))
+    return (dbfs - _DB_FLOOR) / max(1e-6, _DB_CEILING - _DB_FLOOR)
+
+
+def _build_overlay_lut(is_cut: bool, strength: float) -> np.ndarray:
     """图案叠加层用的色标：0 → 全透明，1 → 半透明。
 
-    透明背景让底下的频谱依然可见，对比出"图案落在哪一段频谱上"。
+    两处都跟着参数走，为的是"所见即所得"：
 
-    ``dark`` 对应衰减模式：那一片会被抹掉、在频谱上变暗，所以画成深色；
-    否则是注入模式，那一片会被加上内容、变亮，画成亮色。不给区分的话，
-    两种模式在预览里长得一模一样，只能导出后才分得清。
+    * **颜色按印法算** —— 衰减是把这一片抹掉，画成暗色；注入是往这儿加内容，
+      颜色直接取它在热力色标上对应的位置。以前注入一律画成白色，预览看着
+      挺亮，实际印出来却是暗橙色，容易把强度估错。
+    * **不透明度按强度算** —— 强度本来就是个抽象的 0~1，让它直接决定预览的
+      虚实，拖滑杆时图案随之变浓变淡，比盯着数字直观得多。
     """
+    ratio = max(0.0, min(1.0, float(strength)))
+    alpha = int(round(
+        _OVERLAY_ALPHA_MIN + (_OVERLAY_ALPHA_MAX - _OVERLAY_ALPHA_MIN) * ratio
+    ))
+    red, green, blue = (
+        _OVERLAY_CUT_RGB if is_cut else _heat_color_at(_draw_level_norm(ratio))
+    )
+
     lut = np.zeros((256, 4), dtype=np.uint8)
-    if dark:
-        lut[1:, 0] = 8
-        lut[1:, 1] = 6
-        lut[1:, 2] = 14
-        lut[1:, 3] = 215
-    else:
-        lut[1:, 0] = 255
-        lut[1:, 1] = 255
-        lut[1:, 2] = 255
-        lut[1:, 3] = 205
+    lut[1:, 0] = red
+    lut[1:, 1] = green
+    lut[1:, 2] = blue
+    lut[1:, 3] = alpha
     return lut
 
 
@@ -308,7 +352,8 @@ class SpectrogramView(QWidget):
         self._plot.addItem(self._image)
 
         # 图案叠加层：把二值图案半透明地画在框内，所见即所得
-        self._overlay_lut = _build_overlay_lut(dark=False)
+        # 初值只是占位，主窗口建好后会调 set_preview_style 按实际印法刷新
+        self._overlay_lut = _build_overlay_lut(is_cut=True, strength=DEFAULT_CUT_STRENGTH)
         self._pattern_item = pg.ImageItem()
         self._pattern_item.setZValue(5)
         self._pattern_item.setLookupTable(self._overlay_lut)
@@ -581,13 +626,13 @@ class SpectrogramView(QWidget):
 
     # ------------------------------------------------------------ 循环预览
 
-    def set_engrave_mode(self, is_cut: bool) -> None:
-        """衰减 / 注入切换时，预览配色跟着变。
+    def set_preview_style(self, is_cut: bool, strength: float) -> None:
+        """按印法与强度刷新预览配色。
 
-        不给区分的话两种模式在预览里一模一样（都是白图案），用户只能靠导出
-        结果去猜到底生效没有 —— 而衰减本来就只有几个 dB 的变化，不容易听出来。
+        第一个框和循环影子共用同一套色标 —— 它们本来就是同一个印章的多次印刷，
+        深浅不一样只会让人以为哪里出了岔子。"哪个能调"靠边框和手柄区分就够了。
         """
-        self._overlay_lut = _build_overlay_lut(dark=bool(is_cut))
+        self._overlay_lut = _build_overlay_lut(bool(is_cut), float(strength))
         self._pattern_item.setLookupTable(self._overlay_lut)
         for item in self._loop_items:
             item.setLookupTable(self._overlay_lut)
@@ -654,9 +699,10 @@ class SpectrogramView(QWidget):
 
         while len(self._loop_items) < len(positions):
             item = pg.ImageItem()
+            # 与第一个框共用色标，不另外调 opacity —— 深浅该由强度决定，
+            # 不该因为"这是循环的影子"就无端淡一半
             item.setLookupTable(self._overlay_lut)
             item.setZValue(5)
-            item.setOpacity(_LOOP_GHOST_OPACITY)
             item.setImage(data, axisOrder="row-major", autoLevels=False, levels=(0, 1))
             self._plot.addItem(item)
             self._loop_items.append(item)

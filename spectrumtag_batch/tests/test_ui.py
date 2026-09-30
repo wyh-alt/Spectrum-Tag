@@ -175,6 +175,17 @@ def main() -> int:
         before = page.spectrum.loop_ghost_count()
         check("开启循环后出现影子框", before > 0)
 
+        # 影子和第一个框用同一套色标：它们是同一个印章的多次印刷，
+        # 深浅不一样只会让人以为哪里出了岔子
+        items = page.spectrum._loop_items  # noqa: SLF001
+        same_lut = all(
+            np.array_equal(np.asarray(item.lut), np.asarray(page.spectrum._pattern_item.lut))  # noqa: SLF001
+            for item in items
+        )
+        # 另外确认影子没被额外压低透明度 —— 浓淡该由强度决定
+        no_extra_fade = all(item.opacity() == 1.0 for item in items)
+        check("影子与首个水印浓淡一致", same_lut and no_extra_fade)
+
         # 影子由第一个框 + 间隔推出：把框往后挪，能放下的次数自然变少
         page.start_spin.setValue(0.60)
         page.duration_spin.setValue(0.20)
@@ -347,21 +358,44 @@ def main() -> int:
         check("挖空 -> mode=CUT", job.dsp.mode is EngraveMode.CUT)
         check("衰减增益随强度变化", abs(job.dsp.cut_gain - (1 - job.dsp.strength)) < 1e-9)
 
-        # 预览配色要跟着模式变：衰减是暗块（那片会被抹掉），注入是亮块（会加内容）
-        dark_lut = page.spectrum._overlay_lut[1]  # noqa: SLF001
-        check("衰减模式预览为暗色", dark_lut[0] < 100)
+        # 预览配色跟着印法走：衰减是暗块（那片会被抹掉），注入取热力色标上的颜色
+        cut_lut = page.spectrum._overlay_lut[1]  # noqa: SLF001
+        check("衰减预览为暗色",
+              int(cut_lut[0]) < 100 and int(cut_lut[2]) < 100)
 
         page.engrave_segment.setCurrentItem("draw")
         QApplication.processEvents()
         job = page._collect_job()  # noqa: SLF001
         check("注入 -> mode=DRAW", job.dsp.mode is EngraveMode.DRAW)
 
-        bright_lut = page.spectrum._overlay_lut[1]  # noqa: SLF001
-        check("注入模式预览为亮色", bright_lut[0] > 200)
+        page.strength_slider.set_value(1.0)
+        QApplication.processEvents()
+        draw_lut = page.spectrum._overlay_lut[1]  # noqa: SLF001
+        rgb = tuple(int(v) for v in draw_lut[:3])
+        check(f"注入预览是暖色而非纯白 {rgb}",
+              rgb != (255, 255, 255) and rgb[0] > rgb[2])
 
-        # 两种印法的强度各自独立：切过去取默认，调过再切回来要记得
+        # 不透明度要随强度变化 —— 这是"看浓淡就知道效果强弱"的前提
+        page.strength_slider.set_value(0.2)
+        QApplication.processEvents()
+        faint = int(page.spectrum._overlay_lut[1][3])  # noqa: SLF001
+        page.strength_slider.set_value(1.0)
+        QApplication.processEvents()
+        solid = int(page.spectrum._overlay_lut[1][3])  # noqa: SLF001
+        check(f"预览浓淡随强度变化（{faint} → {solid}）", solid > faint)
+
+        # 两种印法的强度各自独立：切过去取默认，调过再切回来要记得。
+        # 前面调过强度，先把记录复位再验"默认值"
         from ..core.params import DEFAULT_CUT_STRENGTH, DEFAULT_DRAW_STRENGTH
 
+        # 先切到衰减 —— 这一步会把当前滑杆值存进"注入"的记录里，
+        # 所以复位要放在它之后，否则会被那个值盖掉
+        page.engrave_segment.setCurrentItem("cut")
+        QApplication.processEvents()
+        page._strength_by_mode[EngraveMode.DRAW] = DEFAULT_DRAW_STRENGTH  # noqa: SLF001
+
+        page.engrave_segment.setCurrentItem("draw")
+        QApplication.processEvents()
         check("注入的默认强度独立",
               abs(page.strength_slider.value() - DEFAULT_DRAW_STRENGTH) < 1e-6)
         page.strength_slider.set_value(0.9)

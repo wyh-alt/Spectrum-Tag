@@ -681,9 +681,18 @@ class BatchPage(QWidget):
         self.video_format_combo.setEnabled(checked)
 
     def _on_strength_changed(self, _value: float) -> None:
-        """记下当前印法下调到的强度，切走再切回来还能保持。"""
-        self._strength_by_mode[self._current_engrave_mode] = (
-            self.strength_slider.value()
+        """记下当前印法下调到的强度，切走再切回来还能保持。
+
+        顺带刷新预览 —— 强度的作用直接体现在图案的浓淡上，边拖边看才直观。
+        """
+        strength = self.strength_slider.value()
+        self._strength_by_mode[self._current_engrave_mode] = strength
+        self._sync_preview_style()
+
+    def _sync_preview_style(self) -> None:
+        self.spectrum.set_preview_style(
+            self._current_engrave_mode is EngraveMode.CUT,
+            self.strength_slider.value(),
         )
 
     def _on_engrave_changed(self) -> None:
@@ -699,7 +708,7 @@ class BatchPage(QWidget):
             )
             self._current_engrave_mode = mode
             self.strength_slider.set_value(self._strength_by_mode[mode])
-        self.spectrum.set_engrave_mode(mode is EngraveMode.CUT)
+        self._sync_preview_style()
 
     def _on_loop_toggled(self, _checked: bool) -> None:
         self._sync_loop_preview()
