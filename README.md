@@ -233,8 +233,10 @@ spectrumtag_batch/
 python -m PyInstaller build_exe.spec --noconfirm
 ```
 
-产物是单个 `dist/频谱水印生成.exe`（约 130 MB），**ffmpeg 已包含在内**，
-拷到任意 Windows 机器上直接双击即可，无需安装 Python 或任何依赖。
+产物是单个 `dist/频谱水印生成.exe`（约 160 MB，其中 ffmpeg 占大头），
+**ffmpeg 已包含在内**，拷到任意 Windows 机器上直接双击即可，无需安装 Python
+或任何依赖。构建机上的 ffmpeg 由 `build_exe.spec` 自己找（vendor 目录 → PATH
+→ 常见安装位置，逐个跑 `-version` 验过才用），找不到会明确警告。
 
 启动时会先显示启动画面（深色圆角卡片）：单文件模式需要先把内容解压到临时目录，
 这段时间由 PyInstaller 的 bootloader 画面顶着；Python 就绪后交给程序内的
