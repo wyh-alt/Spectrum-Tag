@@ -25,11 +25,18 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass, field
 from typing import Callable, Optional, Sequence
 
 import numpy as np
 
-from .params import DspSpec, EngraveMode, Interval
+from .params import (
+    DEFAULT_CUT_STRENGTH,
+    EngraveMode,
+    Interval,
+    draw_amplitude_for,
+    outline_boost_for,
+)
 
 # WOLA 归一化时判定"窗能量足够"的阈值（对应 C++ 的 kNormEps）
 _NORM_EPS = 1.0e-8
@@ -61,6 +68,67 @@ def hann_window(n: int) -> np.ndarray:
 def _juce_round(values: np.ndarray) -> np.ndarray:
     """复刻 JUCE 的 roundToInt：四舍五入（.5 向上），而非 numpy 的银行家舍入。"""
     return np.floor(np.asarray(values, dtype=np.float64) + 0.5)
+
+
+@dataclass(frozen=True)
+class EngraveBand:
+    """一枚印章铺在频谱上的一个频段 —— 掩码 + 频率落点 + 印法。
+
+    只有一层时就是常规水印；图案描边再加一层：掩码换成图案外沿的那一圈，
+    频率落点照抄，印法取本体的反面（衰减配凸起、注入配衰减）。两层共用同一批
+    时间区间，因此在时间轴上天然同步 —— "峰谷成对"不需要任何对齐逻辑。
+    """
+
+    # 掩码不参与比较与哈希：numpy 数组的 == 返回的是逐元素结果，
+    # 落进 dataclass 自动生成的 __eq__ / __hash__ 里只会炸掉
+    mask: np.ndarray = field(compare=False)
+    freq_low_norm: float = 0.0
+    freq_high_norm: float = 1.0
+    mode: EngraveMode = EngraveMode.CUT
+    strength: float = DEFAULT_CUT_STRENGTH
+    invert: bool = False
+
+    def __post_init__(self) -> None:
+        if self.mask.ndim != 2 or self.mask.size == 0:
+            raise ValueError("掩码必须是二维且非空")
+        if not (0.0 <= self.strength <= 1.0):
+            raise ValueError(f"strength 需在 [0.0, 1.0]，收到 {self.strength}")
+        if not (0.0 <= self.freq_low_norm < self.freq_high_norm <= 1.0):
+            raise ValueError(
+                f"频率范围需满足 0 <= low < high <= 1，"
+                f"收到 {self.freq_low_norm} ~ {self.freq_high_norm}"
+            )
+
+    @property
+    def fft_size(self) -> int:
+        """由掩码行数反推 —— 行数恒为 ``fft_size // 2 + 1``。"""
+        return (self.mask.shape[0] - 1) * 2
+
+    @property
+    def is_draw(self) -> bool:
+        return self.mode is EngraveMode.DRAW
+
+    @property
+    def gain(self) -> float:
+        """乘法模式下图案区域的增益：衰减 < 1、描边 > 1。
+
+        注入不走这条路（它的效果量是加性幅度），这时返回值没有意义。
+        """
+        if self.mode is EngraveMode.BOOST:
+            return outline_boost_for(self.strength)
+        return 1.0 - self.strength
+
+    def levels(self) -> tuple[float, float]:
+        """图案内 / 图案外各自的效果量。
+
+        第二个值同时充当"无效果"的基准：乘法是 1.0（增益不变），注入是 0.0
+        （不注入）。``invert`` 通过交换两者表达。
+        """
+        if self.is_draw:
+            amplitude = draw_amplitude_for(self.strength, self.fft_size)
+            return (0.0, amplitude) if self.invert else (amplitude, 0.0)
+        gain = self.gain
+        return (1.0, gain) if self.invert else (gain, 1.0)
 
 
 def build_binary_mask(
@@ -243,15 +311,12 @@ def _build_mix_curve(
 def render_watermark(
     audio: np.ndarray,
     sample_rate: float,
-    mask: np.ndarray,
-    dsp: DspSpec,
+    bands: Sequence[EngraveBand],
     intervals: Sequence[Interval],
-    freq_low_norm: float,
-    freq_high_norm: float,
     progress: Optional[ProgressFn] = None,
     block_frames: int = _DEFAULT_BLOCK_FRAMES,
 ) -> np.ndarray:
-    """把频谱掩码印到音频上，返回与输入同形状的音频。
+    """把一枚或多枚印章印到音频上，返回与输入同形状的音频。
 
     Parameters
     ----------
@@ -259,17 +324,15 @@ def render_watermark(
         形状 ``(channels, samples)`` 或 ``(samples,)`` 的浮点音频，取值范围约 [-1, 1]。
     sample_rate
         采样率。输出保持原采样率，不做重采样。
-    mask
-        形状 ``(fft_size//2 + 1, num_cols)`` 的掩码，值在 [0, 1]。
-    dsp
-        FFT 尺寸、衰减/注入模式、强度与反相。
+    bands
+        印章频段落列表，每段自带掩码、频率范围与印法（见 :class:`EngraveBand`）。
+        各段的掩码形状必须一致 —— 它们本来就是同一张图案。
 
         衰减是乘法增益（``out = in × gain``），只能削弱已有内容；注入是加性注入
         （在原幅度不足的 bin 上替换为合成信号），因此空白频段也能"画"出图案。
     intervals
-        要施加印章的时间区间列表（秒）。空列表直接返回输入副本。
-    freq_low_norm, freq_high_norm
-        掩码覆盖的归一化频率范围（0 = DC，1 = Nyquist）。
+        要施加印章的时间区间列表（秒）。**所有层共用这一批区间**，所以图案本体
+        与描边严格同步，循环印刷也自动一起走。空列表直接返回输入副本。
 
     Returns
     -------
@@ -279,26 +342,34 @@ def render_watermark(
     def _report(value: float) -> bool:
         return True if progress is None else progress(min(max(value, 0.0), 1.0))
 
+    if not bands:
+        raise ValueError("至少要有一个印章频段")
+
     single_channel = audio.ndim == 1
     work = audio[np.newaxis, :] if single_channel else np.asarray(audio)
     work = np.ascontiguousarray(work, dtype=np.float32)
     num_ch, num_samples = work.shape
 
-    if num_samples == 0:
+    def _passthrough() -> np.ndarray:
         return work[0].copy() if single_channel else work.copy()
 
-    n = int(dsp.fft_size)
+    if num_samples == 0:
+        return _passthrough()
+
+    n = bands[0].fft_size
     hop = n // 4
     num_bins = n // 2 + 1
     group = n // hop                       # 恒为 4
-    if mask.shape[0] != num_bins:
-        raise ValueError(
-            f"掩码行数必须等于 fft_size//2+1 = {num_bins}，收到 {mask.shape[0]}"
-        )
+    shape = (num_bins, bands[0].mask.shape[1])
+    for band in bands:
+        if band.mask.shape != shape:
+            raise ValueError(
+                f"所有频段的掩码必须同为 {shape}，收到 {band.mask.shape}"
+            )
 
     if not intervals:
         _report(1.0)
-        return work[0].copy() if single_channel else work.copy()
+        return _passthrough()
 
     window = hann_window(n)
 
@@ -311,46 +382,41 @@ def render_watermark(
     # 帧 k 的输出时间（用其覆盖区间的起点，与 C++ 一致）
     times = (all_k.astype(np.float64) * hop - n) / sample_rate
 
-    num_cols = mask.shape[1]
+    num_cols = shape[1]
     cols_of_frame = _assign_columns(times, intervals, num_cols)
     touched = cols_of_frame >= 0
     if not touched.any():
         _report(1.0)
-        return work[0].copy() if single_channel else work.copy()
+        return _passthrough()
 
-    # --- 所有列的逐 bin 效果量（一次性算好，之后按帧查表）---
-    is_cut = dsp.mode is EngraveMode.CUT
-    if is_cut:
-        # 衰减：图案区域乘上 cut_gain；反相则内外互换
-        inside, outside = (
-            (1.0, dsp.cut_gain) if dsp.invert else (dsp.cut_gain, 1.0)
-        )
-    else:
-        # 注入：图案区域注入到 draw_amplitude；反相则改为注入背景
-        inside, outside = (
-            (0.0, dsp.draw_amplitude) if dsp.invert else (dsp.draw_amplitude, 0.0)
-        )
-
-    col_field = compute_column_field(
-        mask, sample_rate, n, freq_low_norm, freq_high_norm, inside, outside
-    )                                       # (num_bins, num_cols)
-    neutral = float(outside)                # 无效果时的基准值
+    # --- 每个频段各自的逐 bin 效果量（一次性算好，之后按帧查表）---
+    # 每段一份：(效果量表, 无效果基准值, 逐帧平滑状态, 是否走注入)
+    layers: list[tuple[np.ndarray, float, np.ndarray, bool]] = []
+    for band in bands:
+        inside, outside = band.levels()
+        field = compute_column_field(
+            band.mask, sample_rate, n,
+            band.freq_low_norm, band.freq_high_norm,
+            inside, outside,
+        )                                   # (num_bins, num_cols)
+        layers.append((
+            field,
+            float(outside),
+            np.full(num_bins, outside, dtype=np.float32),
+            band.is_draw,
+        ))
 
     # 一阶 IIR 平滑的时间常数（与 C++ 的 smoothAlpha 一致）
     alpha = 1.0 - math.exp(-(hop / float(sample_rate)) / _GAIN_SMOOTH_SECONDS)
 
-    # 注入模式用的合成相位：每个 bin 有固定初相，跨帧按自身频率线性推进。
+    # 注入用的合成相位：每个 bin 有固定初相，跨帧按自身频率线性推进。
     # 这样注入的信号在帧与帧之间是连续的（听起来像稳态音而非咔哒声），
     # 不同 bin 的初相互不相同，避免所有频率同相叠成一个脉冲。
-    if not is_cut:
-        bin_index = np.arange(num_bins, dtype=np.float64)
-        phase_step = 2.0 * np.pi * bin_index * hop / float(n)
-        phase_origin = np.random.default_rng(20240501).uniform(
-            0.0, 2.0 * np.pi, num_bins
-        )
-    else:
-        phase_step = np.zeros(num_bins, dtype=np.float64)
-        phase_origin = np.zeros(num_bins, dtype=np.float64)
+    bin_index = np.arange(num_bins, dtype=np.float64)
+    phase_step = 2.0 * np.pi * bin_index * hop / float(n)
+    phase_origin = np.random.default_rng(20240501).uniform(
+        0.0, 2.0 * np.pi, num_bins
+    )
 
     # --- 输入补零：帧 k 读 x_pad[:, k*hop : k*hop + N] ---
     x_pad = np.zeros((num_ch, k_end * hop + n), dtype=np.float32)
@@ -363,7 +429,6 @@ def render_watermark(
     ola_norm = np.zeros(ola_len, dtype=np.float32)
     window_sq = (window * window).astype(np.float32)
 
-    smooth_state = np.full(num_bins, neutral, dtype=np.float32)
     next_report = 0.0
 
     for block_begin in range(0, total_frames, block_frames):
@@ -381,23 +446,25 @@ def render_watermark(
         block_cols = cols_of_frame[block_begin:block_end]
         hit = block_cols >= 0
         if hit.any():
-            targets = np.full((block_n, num_bins), neutral, dtype=np.float32)
-            targets[hit] = col_field[:, block_cols[hit]].T
-            # 逐帧一阶平滑（递推是串行的，但每步只做一次 num_bins 向量运算）
-            for i in range(block_n):
-                smooth_state += (targets[i] - smooth_state) * alpha
-                targets[i] = smooth_state
+            hit_cols = block_cols[hit]
+            # 时频坐标对所有频段都一样，逐段套上自己的效果量即可
+            for field, neutral, smooth_state, is_draw in layers:
+                targets = np.full((block_n, num_bins), neutral, dtype=np.float32)
+                targets[hit] = field[:, hit_cols].T
+                # 逐帧一阶平滑（递推是串行的，但每步只做一次 num_bins 向量运算）
+                for i in range(block_n):
+                    smooth_state += (targets[i] - smooth_state) * alpha
+                    targets[i] = smooth_state
 
-            if is_cut:
-                spectrum *= targets[None, :, :]
-            else:
-                # 注入：只在原幅度还不到目标值的 bin 上用合成信号补齐。
-                # 已有内容的地方保持原样，避免与素材本身产生干涉。
-                theta = phase_origin[None, :] + phase_step[None, :] * ks[:, None]
-                synth = (targets * np.exp(1j * theta)).astype(spectrum.dtype)
-                magnitude = np.abs(spectrum)
-                replace = magnitude < targets[None, :, :]
-                np.copyto(spectrum, synth[None, :, :], where=replace)
+                if not is_draw:
+                    spectrum *= targets[None, :, :]
+                else:
+                    # 注入：只在原幅度还不到目标值的 bin 上用合成信号补齐。
+                    # 已有内容的地方保持原样，避免与素材本身产生干涉。
+                    theta = phase_origin[None, :] + phase_step[None, :] * ks[:, None]
+                    synth = (targets * np.exp(1j * theta)).astype(spectrum.dtype)
+                    replace = np.abs(spectrum) < targets[None, :, :]
+                    np.copyto(spectrum, synth[None, :, :], where=replace)
 
         restored = np.fft.irfft(spectrum, n=n, axis=-1).astype(np.float32)
         weighted = restored * window[None, None, :]
@@ -417,7 +484,7 @@ def render_watermark(
         if done >= next_report:
             next_report = done + 0.01
             if not _report(done):
-                return work[0].copy() if single_channel else work.copy()
+                return _passthrough()
 
     # --- WOLA 归一化 ---
     region = ola_norm[n : n + num_samples]

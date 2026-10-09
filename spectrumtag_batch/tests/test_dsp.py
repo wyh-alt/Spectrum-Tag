@@ -2,13 +2,15 @@
 
 直接运行：``python -m spectrumtag_batch.tests.test_dsp``
 
-四个检查项：
+检查项：
 
 1. **恒等性**：``amplitude_ratio = 1.0`` 时所有 bin 增益都是 1，
    整条链路应当是无损重建。这一步同时检验帧几何、WOLA 归一化、重叠相加分组。
 2. **脉冲对齐**：脉冲位置不得移动 —— 检验 N-1 的群延迟补偿是否正确。
 3. **掩码生效**：``ratio = 0`` 应当把目标频段的能量显著压下去。
 4. **循环印刷**：多个区间都要留下印章，且区间之外保持原样。
+5. **注入模式**：静音素材上也能"画"出图案。
+6. **图案描边**：本体与外圈朝相反方向处理，配成峰谷对。
 """
 
 from __future__ import annotations
@@ -17,14 +19,16 @@ import sys
 
 import numpy as np
 
-from ..core.dsp import build_binary_mask, render_watermark
+from ..core.dsp import EngraveBand, build_binary_mask, render_watermark
 from ..core.params import (
+    DEFAULT_CUT_STRENGTH,
     DspSpec,
     EngraveMode,
     Interval,
     LoopSpec,
     PlacementSpec,
     PositionMode,
+    outline_boost_for,
     resolve_intervals,
 )
 
@@ -45,6 +49,31 @@ def _full_mask(num_cols: int = 64) -> np.ndarray:
     return np.ones((NUM_BINS, num_cols), dtype=np.float32)
 
 
+def _band(
+    dsp: DspSpec,
+    low_norm: float,
+    high_norm: float,
+    mode: EngraveMode | None = None,
+) -> EngraveBand:
+    """按 DspSpec 造一个频段；``mode`` 可以覆盖掉它自带的印法。"""
+    return EngraveBand(
+        _full_mask(), low_norm, high_norm,
+        mode or dsp.mode, dsp.strength, dsp.invert,
+    )
+
+
+def _render(
+    audio: np.ndarray,
+    dsp: DspSpec,
+    intervals: list[Interval],
+    low_norm: float = 0.10,
+    high_norm: float = 0.40,
+    extra: list[EngraveBand] | None = None,
+) -> np.ndarray:
+    bands = [_band(dsp, low_norm, high_norm)] + list(extra or [])
+    return render_watermark(audio, SR, bands, intervals)
+
+
 def check_identity() -> bool:
     """强度 0 → 增益恒为 1 → 应无损重建。"""
     num = SR  # 1 秒
@@ -52,10 +81,7 @@ def check_identity() -> bool:
     audio = (rng.standard_normal(num) * 0.1).astype(np.float32)
 
     dsp = DspSpec(fft_size=FFT_SIZE, mode=EngraveMode.CUT, strength=0.0)
-    out = render_watermark(
-        audio, SR, _full_mask(), dsp,
-        [Interval(0.0, 1.0)], freq_low_norm=0.1, freq_high_norm=0.4,
-    )
+    out = _render(audio, dsp, [Interval(0.0, 1.0)], 0.1, 0.4)
 
     err = float(np.max(np.abs(out - audio)))
     rms = float(np.sqrt(np.mean(audio.astype(np.float64) ** 2)))
@@ -74,10 +100,7 @@ def check_impulse_alignment() -> bool:
         audio[p] = 1.0
 
     dsp = DspSpec(fft_size=FFT_SIZE, mode=EngraveMode.CUT, strength=0.0)
-    out = render_watermark(
-        audio, SR, _full_mask(), dsp,
-        [Interval(0.0, 1.0)], freq_low_norm=0.05, freq_high_norm=0.95,
-    )
+    out = _render(audio, dsp, [Interval(0.0, 1.0)], 0.05, 0.95)
 
     # 峰值位置应与输入一致（脉冲经过加窗重建后会略微扩散，取邻域最大值）
     shifted = 0
@@ -105,10 +128,7 @@ def check_mask_effect() -> bool:
     hi_hz = high_norm * SR / 2
 
     dsp = DspSpec(fft_size=FFT_SIZE, mode=EngraveMode.CUT, strength=1.0)
-    out = render_watermark(
-        audio, SR, _full_mask(), dsp,
-        [Interval(0.0, 1.0)], freq_low_norm=low_norm, freq_high_norm=high_norm,
-    )
+    out = _render(audio, dsp, [Interval(0.0, 1.0)], low_norm, high_norm)
 
     # 只测区间中部：两端各有 20ms 的淡入淡出，那里按设计本来就保留干信号
     a, b = int(0.10 * SR), int(0.90 * SR)
@@ -158,9 +178,9 @@ def check_loop_intervals() -> bool:
     )
 
     dsp = DspSpec(fft_size=FFT_SIZE, mode=EngraveMode.CUT, strength=1.0)
-    out = render_watermark(
-        audio, SR, _full_mask(), dsp, intervals,
-        freq_low_norm=placement.freq_low_norm, freq_high_norm=placement.freq_high_norm,
+    out = _render(
+        audio, dsp, intervals,
+        placement.freq_low_norm, placement.freq_high_norm,
     )
 
     lo_hz, hi_hz = 0.10 * SR / 2, 0.20 * SR / 2
@@ -202,10 +222,7 @@ def check_draw_mode() -> bool:
     stamp = [Interval(0.30, 0.70)]
 
     def render(dsp):
-        return render_watermark(
-            silent, SR, _full_mask(), dsp, stamp,
-            freq_low_norm=low_norm, freq_high_norm=high_norm,
-        )
+        return _render(silent, dsp, stamp, low_norm, high_norm)
 
     cut_out = render(DspSpec(fft_size=FFT_SIZE, mode=EngraveMode.CUT, strength=1.0))
     cut_peak = float(np.max(np.abs(cut_out)))
@@ -254,7 +271,6 @@ def check_truncated_stamp_not_squashed() -> bool:
     时长推进，走到哪儿算哪儿。
     """
     from ..core.dsp import _assign_columns
-    from ..core.params import LoopSpec, PlacementSpec, PositionMode, resolve_intervals
 
     # 音频 4 秒、印章 1.5 秒、间隔 1.5 秒：
     #   0.0~1.5 完整；3.0~4.5 被末尾截成 3.0~4.0
@@ -291,6 +307,96 @@ def check_truncated_stamp_not_squashed() -> bool:
     return ok
 
 
+def check_outline_peak_valley() -> bool:
+    """图案描边：本体削弱时外圈被抬起来，本体注入时外圈被压下去 —— 峰谷成对。
+
+    掩码手工摆成两片：下半是"本体"、紧挨着上面一条是"外圈"。真实路径里
+    这两片由 ``pattern.build_outline`` 从图案算出来（形状检查在 test_pattern），
+    这里只验 DSP 层对这两片确实朝相反方向处理。
+    """
+    num = SR * 2
+    rng = np.random.default_rng(21)
+    audio = (rng.standard_normal(num) * 0.12).astype(np.float32)
+    stamp = [Interval(0.30, 1.70)]
+
+    low_norm, high_norm = 0.10, 0.20
+    band_lo = low_norm * SR / 2
+    span_hz = (high_norm - low_norm) * SR / 2
+    # 掩码行号大 = 频率高：本体占上半段，外圈紧贴在它下方
+    ring_rows = 200
+    body = np.zeros((NUM_BINS, 64), dtype=np.float32)
+    body[NUM_BINS // 2 :, :] = 1.0
+    ring = np.zeros_like(body)
+    ring[NUM_BINS // 2 - ring_rows : NUM_BINS // 2, :] = 1.0
+
+    hz_of_row = lambda row: band_lo + span_hz * row / (NUM_BINS - 1)  # noqa: E731
+    body_hz = (hz_of_row(NUM_BINS // 2 + 20), hz_of_row(NUM_BINS - 20))
+    ring_hz = (hz_of_row(NUM_BINS // 2 - ring_rows + 20), hz_of_row(NUM_BINS // 2 - 20))
+
+    def render(mode: EngraveMode, strength: float) -> np.ndarray:
+        # 外圈与本体反着来：衰减配凸起、注入配衰减。这条规则住在
+        # render.plan_render 里（DSP 层不知道"描边"是什么），test_pattern
+        # 会另行确认它确实是这么组装的。
+        ring_mode = (
+            EngraveMode.CUT if mode is EngraveMode.DRAW else EngraveMode.BOOST
+        )
+        bands = [
+            EngraveBand(body, low_norm, high_norm, mode, strength),
+            EngraveBand(ring, low_norm, high_norm, ring_mode, strength),
+        ]
+        return render_watermark(audio, SR, bands, stamp)
+
+    a, b = int(0.60 * SR), int(1.40 * SR)
+
+    def delta_db(out: np.ndarray, lo: float, hi: float) -> float:
+        before = _band_energy(audio[a:b], lo, hi)
+        after = _band_energy(out[a:b], lo, hi)
+        return 10 * np.log10(max(after, 1e-30) / max(before, 1e-30))
+
+    # 衰减 + 描边：本体塌下去、外圈鼓起来
+    cut_out = render(EngraveMode.CUT, 0.8)
+    cut_body = delta_db(cut_out, *body_hz)
+    cut_ring = delta_db(cut_out, *ring_hz)
+
+    # 注入 + 描边：本体亮起来、外圈压下去
+    draw_out = render(EngraveMode.DRAW, 0.8)
+    draw_body = delta_db(draw_out, *body_hz)
+    draw_ring = delta_db(draw_out, *ring_hz)
+
+    ok = (
+        cut_body < -8.0        # 本体被削弱
+        and cut_ring > 3.0     # 外圈被抬起来（+7.7 dB 的目标值，留足余量）
+        and draw_body > 3.0    # 本体被注入出内容
+        and draw_ring < -3.0   # 外圈被压下去
+    )
+    print(f"[8] 图案描边（峰谷成对）    衰减：本体 {cut_body:+.1f} dB / 外圈 {cut_ring:+.1f} dB   "
+          f"注入：本体 {draw_body:+.1f} dB / 外圈 {draw_ring:+.1f} dB"
+          f"  ->  {'通过' if ok else '失败'}")
+    return ok
+
+
+def check_outline_boost_range() -> bool:
+    """描边的量要与凹陷配套：凸起落在 +6~9 dB，凹陷随强度线性加深。
+
+    数值本身是取舍（听得出来但不刺耳、不撞削波），但它与凹陷是一对 ——
+    这条守着两者不会在后续调参里跑偏到一边去。
+    """
+    default_db = 20 * np.log10(outline_boost_for(DEFAULT_CUT_STRENGTH))
+    full_db = 20 * np.log10(outline_boost_for(1.0))
+    cut_default_db = 20 * np.log10(1.0 - DEFAULT_CUT_STRENGTH)
+
+    ok = (
+        6.0 < default_db < 9.0                 # 默认强度下的凸起在设计区间里
+        and 8.0 < full_db < 9.5                # 拉满也不过 +9.5 dB，别撞削波
+        and abs(cut_default_db + 26.0) < 0.5   # 默认凹陷约 -26 dB
+        and outline_boost_for(0.0) == 1.0      # 强度 0 时不该有任何凸起
+    )
+    print(f"[9] 描边的量                默认强度凸起 {default_db:+.1f} dB / "
+          f"拉满 {full_db:+.1f} dB   对照凹陷 {cut_default_db:+.1f} dB"
+          f"  ->  {'通过' if ok else '失败'}")
+    return ok
+
+
 def check_mask_rasterization() -> bool:
     """图案栅格化：纵向必须翻转（row 0 = 最低频 = 图片底部）。"""
     # 8×8 图案，只有最上面一行是本体（图片顶部 = 高频）
@@ -324,6 +430,8 @@ def main() -> int:
         check_draw_mode(),
         check_truncated_stamp_not_squashed(),
         check_mask_rasterization(),
+        check_outline_peak_valley(),
+        check_outline_boost_range(),
     ]
 
     passed = sum(results)

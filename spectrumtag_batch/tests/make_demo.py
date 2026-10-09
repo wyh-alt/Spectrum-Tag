@@ -16,12 +16,18 @@ from PIL import Image, ImageDraw, ImageFont
 from ..core.params import (
     DspSpec,
     EngraveMode,
+    LoopSpec,
     PatternSource,
     PatternSpec,
     PlacementSpec,
     PositionMode,
     RenderJob,
 )
+
+# 演示图只看清"印上去的是什么样"，所以循环显式关掉 —— 它是界面上的默认行为，
+# 但在对比图里铺满整段会把三个面板糊成一片。图案描边保留：它也是默认行为，
+# 而且正好把"本体与外圈反向"这件事一并显示出来。
+_SINGLE_STAMP = dict(loop=LoopSpec(enabled=False))
 from ..core.render import render_audio
 from ..ui.spectrogram import compute_display_spectrogram, db_to_rgb
 
@@ -113,11 +119,17 @@ def make_draw_vs_cut() -> str:
 
     cut_audio = render_audio(
         audio, SR,
-        RenderJob(dsp=DspSpec(fft_size=4096, mode=_Mode.CUT, strength=1.0), **common),
+        RenderJob(
+            dsp=DspSpec(fft_size=4096, mode=_Mode.CUT, strength=1.0),
+            **common, **_SINGLE_STAMP,
+        ),
     )
     draw_audio = render_audio(
         audio, SR,
-        RenderJob(dsp=DspSpec(fft_size=4096, mode=_Mode.DRAW, strength=0.85), **common),
+        RenderJob(
+            dsp=DspSpec(fft_size=4096, mode=_Mode.DRAW, strength=0.85),
+            **common, **_SINGLE_STAMP,
+        ),
     )
 
     shows = [audio, cut_audio, draw_audio]
@@ -168,6 +180,7 @@ def main() -> int:
             duration=STAMP_DURATION,
             position_mode=PositionMode.ABSOLUTE,
         ),
+        **_SINGLE_STAMP,
     )
 
     processed = render_audio(audio, SR, job)

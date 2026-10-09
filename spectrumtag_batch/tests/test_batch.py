@@ -192,8 +192,10 @@ def check_watermark_actually_embedded(tmp: str) -> bool:
     original = read_audio(path)
     tagged = read_audio(result.items[0].output_path)
     sr = original.sample_rate
-    lo_hz = FREQ_LOW_NORM * sr / 2
-    hi_hz = FREQ_HIGH_NORM * sr / 2
+    # 测量区间往里收一点：图案描边会占住频段最外那一圈，而那一圈是按设计
+    # 被**抬起来**的（峰谷对），量进去只会把衰减幅度冲淡
+    lo_hz = (FREQ_LOW_NORM + 0.01) * sr / 2
+    hi_hz = (FREQ_HIGH_NORM - 0.01) * sr / 2
 
     def slice_at(data, t0, t1):
         a, b = int(t0 * sr), int(t1 * sr)

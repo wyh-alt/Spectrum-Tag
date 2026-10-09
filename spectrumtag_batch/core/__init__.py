@@ -1,10 +1,18 @@
 """算法核心 —— 不依赖任何 UI 框架，可在子进程/工作线程中直接使用。"""
 
-from .dsp import build_binary_mask, compute_column_field, hann_window, render_watermark
+from .dsp import (
+    EngraveBand,
+    build_binary_mask,
+    compute_column_field,
+    hann_window,
+    render_watermark,
+)
 from .params import (
     DEFAULT_CUT_STRENGTH,
     DEFAULT_DRAW_STRENGTH,
     DEFAULT_FFT_SIZE,
+    DEFAULT_HIGH_FREQ_HZ,
+    DEFAULT_LOW_FREQ_HZ,
     DRAW_LEVEL_MAX_DBFS,
     DRAW_LEVEL_MIN_DBFS,
     FFT_SIZE_CHOICES,
@@ -21,12 +29,14 @@ from .params import (
     PlacementSpec,
     PositionMode,
     RenderJob,
+    outline_boost_for,
     resolve_intervals,
 )
 
 __all__ = [
     "DspSpec",
     "EngraveMode",
+    "EngraveBand",
     "Interval",
     "LoopSpec",
     "PatternSource",
@@ -34,6 +44,7 @@ __all__ = [
     "PlacementSpec",
     "PositionMode",
     "RenderJob",
+    "outline_boost_for",
     "resolve_intervals",
     "build_binary_mask",
     "compute_column_field",
@@ -42,6 +53,8 @@ __all__ = [
     "DEFAULT_CUT_STRENGTH",
     "DEFAULT_DRAW_STRENGTH",
     "DEFAULT_FFT_SIZE",
+    "DEFAULT_HIGH_FREQ_HZ",
+    "DEFAULT_LOW_FREQ_HZ",
     "DRAW_LEVEL_MIN_DBFS",
     "DRAW_LEVEL_MAX_DBFS",
     "FFT_SIZE_CHOICES",

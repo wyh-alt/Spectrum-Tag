@@ -200,8 +200,8 @@ def main() -> int:
     )
     _log_startup("准备 show()")
     window.show()
-    # 尺寸与位置都必须在 show() 之后再定：FluentWindow 的延迟初始化会在事件
-    # 循环第一次转动时把尺寸重置成默认值，之前设的留不住（详见 apply_default_size）
+    # 尺寸与位置都放在 show() 之后再定（详见 apply_default_size 里的注记：
+    # 从前带导航栏的窗口会延迟重置尺寸，换成现在的基类后不必需了，但顺序留着）
     app.processEvents()
     window.apply_default_size()
     _center_on_screen(window)

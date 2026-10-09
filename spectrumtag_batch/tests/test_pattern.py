@@ -27,7 +27,13 @@ from ..core.params import (
     PositionMode,
     RenderJob,
 )
-from ..core.pattern import PatternError, find_default_font, render_text_pattern
+from ..core.pattern import (
+    _OUTLINE_WIDTH_RATIO,
+    PatternError,
+    build_outline,
+    find_default_font,
+    render_text_pattern,
+)
 from ..core.render import choose_num_cols, plan_render
 
 SR = 44100
@@ -158,10 +164,70 @@ def check_plan_render() -> bool:
     num_cols = choose_num_cols(plan.intervals, SR, FFT_SIZE)
     expected_cols = round(1.0 * SR / (FFT_SIZE // 4))
     cols_ok = num_cols == min(expected_cols, 4096)
-    shape_ok = plan.mask.shape == (NUM_BINS, num_cols)
+    shape_ok = plan.main_band.mask.shape == (NUM_BINS, num_cols)
 
-    ok = intervals_ok and last_ok and cols_ok and shape_ok
-    print(f"[4] 渲染计划                区间 = {starts}  掩码 = {plan.mask.shape}"
+    # 默认开着图案描边：计划里该多挂一层 —— 频率范围与本体完全一致，
+    # 印法朝反方向（衰减配凸起），掩码是另一张（外沿那一圈）
+    ring = plan.outline_band
+    outline_ok = (
+        ring is not None
+        and ring.mode is EngraveMode.BOOST
+        and ring.freq_low_norm == plan.main_band.freq_low_norm
+        and ring.freq_high_norm == plan.main_band.freq_high_norm
+        and ring.mask.shape == plan.main_band.mask.shape
+        and not np.array_equal(ring.mask, plan.main_band.mask)
+        and not (ring.mask.astype(bool) & plan.main_band.mask.astype(bool)).any()
+    )
+    # 注入印法下描边反过来去衰减 —— 峰谷对不分用哪种印法
+    draw_ring = plan_render(
+        job.with_dsp(mode=EngraveMode.DRAW), SR, total
+    ).outline_band
+    inverted_ok = draw_ring is not None and draw_ring.mode is EngraveMode.CUT
+    # 关掉描边就只剩本体一层
+    single_ok = plan_render(
+        job.with_pattern(outline=False), SR, total
+    ).outline_band is None
+
+    ok = (intervals_ok and last_ok and cols_ok and shape_ok
+          and outline_ok and inverted_ok and single_ok)
+    print(f"[4] 渲染计划                区间 = {starts}  掩码 = {plan.main_band.mask.shape}  "
+          f"层数 = {len(plan.bands)}（外圈 {ring.mode.value if ring else '无'}）"
+          f"  ->  {'通过' if ok else '失败'}")
+    return ok
+
+
+def check_outline_shape() -> bool:
+    """描边就是本体外沿的一圈：不与本体重叠、恰好包住本体、宽度随图案缩放。
+
+    宽度按**较短边**算 —— 那一边对应印章框的频率方向，也是描边最容易把
+    图案吃掉的方向。
+    """
+    pattern = np.zeros((200, 400), dtype=bool)
+    pattern[80:120, 100:300] = True                 # 中间一块实心矩形
+    radius = max(1, round(min(pattern.shape) * _OUTLINE_WIDTH_RATIO))
+
+    outline = build_outline(pattern)
+    no_overlap = not (outline & pattern).any()
+
+    rows = np.where(outline.any(axis=1))[0]
+    cols = np.where(outline.any(axis=0))[0]
+    # 外扩了 radius 圈，一圈不多一圈不少
+    ring_rows = (int(rows.min()), int(rows.max())) == (80 - radius, 119 + radius)
+    ring_cols = (int(cols.min()), int(cols.max())) == (100 - radius, 299 + radius)
+    # 实心块的描边是个"回"字形，面积可以精确算出来
+    expected = (
+        (120 - 80 + 2 * radius) * (300 - 100 + 2 * radius) - (120 - 80) * (300 - 100)
+    )
+    count_ok = int(outline.sum()) == expected
+
+    # 文字那种细笔画也必须描得出来
+    text_outline = build_outline(render_text_pattern("AB", weight=0.25))
+    text_ok = bool(text_outline.any())
+
+    ok = no_overlap and ring_rows and ring_cols and count_ok and text_ok
+    print(f"[6] 描边形状                半径 = {radius}px  外框 = "
+          f"{rows.min()}~{rows.max()} × {cols.min()}~{cols.max()}  像素 = "
+          f"{int(outline.sum())}（期望 {expected}）  文字可描 = {text_ok}"
           f"  ->  {'通过' if ok else '失败'}")
     return ok
 
@@ -178,6 +244,7 @@ def main() -> int:
         check_image_brightness_mode(),
         check_plan_render(),
         check_text_not_clipped(),
+        check_outline_shape(),
     ]
 
     passed = sum(results)

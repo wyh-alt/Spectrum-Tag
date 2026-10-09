@@ -18,15 +18,16 @@ from typing import Callable, Optional, Sequence
 
 import numpy as np
 
-from .dsp import build_binary_mask, render_watermark
+from .dsp import EngraveBand, build_binary_mask, render_watermark
 from .params import (
     MAX_MASK_COLS,
     MIN_MASK_COLS,
+    EngraveMode,
     Interval,
     RenderJob,
     resolve_intervals,
 )
-from .pattern import build_pattern
+from .pattern import build_outline, build_pattern
 
 class EmptyRender(RuntimeError):
     """没有任何区间落在音频范围内（例如起点超出音频时长）。"""
@@ -34,12 +35,25 @@ class EmptyRender(RuntimeError):
 
 @dataclass(frozen=True)
 class RenderPlan:
-    """一次渲染的完整计划，UI 预览与批处理共用。"""
+    """一次渲染的完整计划，UI 预览与批处理共用。
+
+    ``bands`` 是这枚印章实际要用到的所有掩码层：第一段永远是图案本体，
+    开了「图案描边」则还有第二段 —— 图案外沿那一圈。它们频率范围相同、
+    时间区间也共用，只是效果量方向相反。
+    """
 
     intervals: tuple[Interval, ...]
-    mask: np.ndarray
-    freq_low_norm: float
-    freq_high_norm: float
+    bands: tuple[EngraveBand, ...]
+
+    @property
+    def main_band(self) -> EngraveBand:
+        """图案本体 —— ``bands[0]`` 读起来不容易记住。"""
+        return self.bands[0]
+
+    @property
+    def outline_band(self) -> Optional[EngraveBand]:
+        """图案描边那一层；没开描边时 None。"""
+        return self.bands[1] if len(self.bands) > 1 else None
 
     @property
     def total_stamp_seconds(self) -> float:
@@ -83,12 +97,31 @@ def plan_render(
     pattern = build_pattern(job.pattern) if binary_pattern is None else binary_pattern
     mask = build_binary_mask(pattern, num_bins, num_cols)
 
-    return RenderPlan(
-        intervals=tuple(intervals),
-        mask=mask,
-        freq_low_norm=job.placement.freq_low_norm,
-        freq_high_norm=job.placement.freq_high_norm,
-    )
+    low_norm = job.placement.freq_low_norm
+    high_norm = job.placement.freq_high_norm
+
+    bands = [EngraveBand(
+        mask, low_norm, high_norm,
+        job.dsp.mode, job.dsp.strength, job.dsp.invert,
+    )]
+
+    # 图案描边：外沿那一圈朝**反方向**处理，与本体配成峰谷对。
+    #
+    #   衰减：本体塌下去、外圈鼓起来 → 想填平凹陷，外圈就凸得更显眼
+    #   注入：本体亮起来、外圈压下去 → 想抹掉亮块，外圈又会缺一块
+    #
+    # 两头互相牵制，单改哪一边都会在频谱上留下另一种痕迹，这就是它抬高
+    # 去除成本的方式。强度沿用本体的：描边的量本来就该跟着当前强度走。
+    if job.pattern.outline:
+        outline_mask = build_binary_mask(build_outline(pattern), num_bins, num_cols)
+        outline_mode = (
+            EngraveMode.CUT if job.dsp.mode is EngraveMode.DRAW else EngraveMode.BOOST
+        )
+        bands.append(EngraveBand(
+            outline_mask, low_norm, high_norm, outline_mode, job.dsp.strength,
+        ))
+
+    return RenderPlan(intervals=tuple(intervals), bands=tuple(bands))
 
 
 def render_audio(
@@ -116,10 +149,7 @@ def render_audio(
     return render_watermark(
         audio,
         sample_rate,
-        plan.mask,
-        job.dsp,
+        plan.bands,
         plan.intervals,
-        plan.freq_low_norm,
-        plan.freq_high_norm,
         progress=progress,
     )

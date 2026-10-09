@@ -14,6 +14,16 @@ from typing import Optional
 MIN_DISPLAY_HZ = 20.0
 MAX_DISPLAY_HZ = 22000.0
 
+# 默认水印落点：低频 9 kHz、高频 10.5 kHz。
+# 归一化值本身与采样率无关，这里的基准 Nyquist 只是把"9 kHz"折算成一个
+# 默认数字（44.1 kHz 素材的 Nyquist），界面上显示的仍是实实在在的 Hz。
+#
+# 跨度给到 1.5 kHz：44.1 kHz 素材上相当于 139 个频率采样点。再窄的话，
+# 一行文字挤进几十个点里就只剩一团糊影。
+DEFAULT_LOW_FREQ_HZ = 9_000.0
+DEFAULT_HIGH_FREQ_HZ = 10_500.0
+DEFAULT_REF_NYQUIST_HZ = 22_050.0
+
 # FFT 档位
 FFT_SIZE_CHOICES = (1024, 2048, 4096, 8192)
 DEFAULT_FFT_SIZE = 4096
@@ -31,17 +41,21 @@ class PatternSource(Enum):
 
 
 class EngraveMode(Enum):
-    """水印怎么印上去 —— 这是两种性质不同的处理。
+    """水印怎么印上去 —— 前两种印法性质不同，第三种是图案描边专用的。
 
     ``CUT``（衰减）是**乘法增益**：``out = in × gain``，把图案区域的能量削弱。
     素材里本来就没有内容的频段，乘任何系数仍然是空的。
 
     ``DRAW``（注入）是**加性合成**：``out = in + synth``，在图案区域造出内容。
     因此即使超高频原本一片空白，也能"画"出图案 —— 这正是衰减做不到的。
+
+    ``BOOST``（凸起）同样走乘法，只是增益大于 1。它不单独作为印法暴露给用户，
+    只给图案描边用：外圈那一道被抬起来的边，与图案本体的凹陷配成峰谷对。
     """
 
     CUT = "cut"
     DRAW = "draw"
+    BOOST = "boost"
 
 
 class AudioFormat(Enum):
@@ -142,6 +156,12 @@ class PatternSpec:
     binary_threshold: Optional[float] = None
     invert_pattern: bool = False         # 图案内外互换（白字黑底场景可手动纠正）
 
+    # --- 描边 ---
+    # 沿图案外沿描一圈"反向"处理，与图案本体配成峰谷对：衰减时外圈凸起、
+    # 注入时外圈凹陷（见 render.plan_render）。想抹掉图案就得同时处理外圈，
+    # 而外圈一动图案又露出来 —— 两头的代价互相牵制。
+    outline: bool = True
+
     def cache_key(self) -> tuple:
         """用于缓存已渲染二值图的键。"""
         return (
@@ -152,6 +172,7 @@ class PatternSpec:
             self.weight,
             self.binary_threshold,
             self.invert_pattern,
+            self.outline,
         )
 
 
@@ -162,11 +183,46 @@ DRAW_LEVEL_MAX_DBFS = -25.0
 # 两种印法各自的默认强度，取值考虑不一样：
 #
 #   * 衰减要更狠一点才听得出差别 —— 图案只占频段的一部分，摊到整段往往只剩
-#     几个 dB，0.8 对应图案区增益 0.2（约 -14 dB）；
+#     几个 dB。0.95 对应图案区增益 0.05（约 -26 dB），轮廓在频谱上是实心的；
 #   * 注入不宜过强 —— 它是凭空造内容，铺得宽一点就容易削波，0.6 对应每个
 #     频点约 -47 dBFS。
-DEFAULT_CUT_STRENGTH = 0.8
+DEFAULT_CUT_STRENGTH = 0.95
 DEFAULT_DRAW_STRENGTH = 0.6
+
+
+def draw_dbfs_for(strength: float) -> float:
+    """注入强度（0~1）映射到的目标电平（dBFS，满量程正弦 = 0）。"""
+    return DRAW_LEVEL_MIN_DBFS + (
+        DRAW_LEVEL_MAX_DBFS - DRAW_LEVEL_MIN_DBFS
+    ) * strength
+
+
+# 图案描边的凸起增益随强度线性增长：强度 1 时约 +9 dB（2.8 倍），
+# 强度 0.95（衰减的默认值）时约 +8.7 dB —— 都落在"听得出来但不刺耳"的区间里。
+#
+# 斜率定得比凹陷温和（凹陷 0.95 是 -26 dB）：凸起是**抬升已有内容**，
+# 幅度上比削弱更容易撞到削波，不该和凹陷等量。
+OUTLINE_BOOST_SLOPE = 1.8
+
+
+def outline_boost_for(strength: float) -> float:
+    """图案描边的凸起增益（线性倍数）。
+
+    与衰减的 ``1 - strength`` 方向相反、量级也略小 —— 凸起是**抬升已有内容**，
+    幅度上比削弱更容易撞到削波，所以不宜和凹陷等量。
+    """
+    return 1.0 + OUTLINE_BOOST_SLOPE * strength
+
+
+def draw_amplitude_for(strength: float, fft_size: int) -> float:
+    """注入模式下写到频谱 bin 上的线性幅度。
+
+    频谱图上衡量一个 bin 的电平用的是 ``20·log10(2·|X[k]|/N)``（即"该频率正弦的
+    幅度"），所以要让某个 bin 显示成指定 dBFS，写进频谱的复数模必须是
+    ``A · N / 2`` —— 直接写 ``A`` 会小掉 N/2 倍（4096 点时是 66 dB）。
+    """
+    linear = float(10.0 ** (draw_dbfs_for(strength) / 20.0))
+    return linear * fft_size / 2.0
 
 
 @dataclass(frozen=True)
@@ -198,20 +254,12 @@ class DspSpec:
     @property
     def draw_dbfs(self) -> float:
         """注入模式下每个 bin 的目标电平（dBFS，满量程正弦 = 0）。"""
-        return DRAW_LEVEL_MIN_DBFS + (
-            DRAW_LEVEL_MAX_DBFS - DRAW_LEVEL_MIN_DBFS
-        ) * self.strength
+        return draw_dbfs_for(self.strength)
 
     @property
     def draw_amplitude(self) -> float:
-        """注入模式下写到频谱 bin 上的线性幅度。
-
-        频谱图上衡量一个 bin 的电平用的是 ``20·log10(2·|X[k]|/N)``（即"该频率正弦的
-        幅度"），所以要让某个 bin 显示成指定 dBFS，写进频谱的复数模必须是
-        ``A · N / 2`` —— 直接写 ``A`` 会小掉 N/2 倍（4096 点时是 66 dB）。
-        """
-        linear = float(10.0 ** (self.draw_dbfs / 20.0))
-        return linear * self.fft_size / 2.0
+        """注入模式下写到频谱 bin 上的线性幅度。"""
+        return draw_amplitude_for(self.strength, self.fft_size)
 
 
 @dataclass(frozen=True)
@@ -222,10 +270,10 @@ class PlacementSpec:
     其单位是"秒"还是"占总时长的比例"。
     """
 
-    freq_low_norm: float = 0.05
-    freq_high_norm: float = 0.45
+    freq_low_norm: float = DEFAULT_LOW_FREQ_HZ / DEFAULT_REF_NYQUIST_HZ
+    freq_high_norm: float = DEFAULT_HIGH_FREQ_HZ / DEFAULT_REF_NYQUIST_HZ
 
-    start: float = 0.10        # 起点（秒 或 0~1 比例）
+    start: float = 0.0         # 起点（秒 或 0~1 比例）
     duration: float = 0.30     # 单次印刷的持续长度（秒 或 0~1 比例）
 
     position_mode: PositionMode = PositionMode.RELATIVE
@@ -247,7 +295,7 @@ class PlacementSpec:
 class LoopSpec:
     """循环印刷：勾选后每隔 interval_sec 在同样的频段位置重复印刷一次。"""
 
-    enabled: bool = False
+    enabled: bool = True
     # 上一次印完到下一次开始之间的距离（不是"从起点算的固定周期"，
     # 所以印章本身的长度不会挤占间隔）
     interval_sec: float = 5.0

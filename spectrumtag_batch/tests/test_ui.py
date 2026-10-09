@@ -118,6 +118,14 @@ def main() -> int:
         check(f"衰减强度默认为 {DEFAULT_CUT_STRENGTH:g}",
               abs(page.strength_slider.value() - DEFAULT_CUT_STRENGTH) < 1e-6)
 
+        # 默认落点：9~10.5 kHz、从 0 开始；循环、描边、保持比例都默认开着
+        check("低频默认 9 kHz", abs(page.low_freq_spin.value() - 9000) < 1)
+        check("高频默认 10.5 kHz", abs(page.high_freq_spin.value() - 10500) < 1)
+        check("起点默认 0", abs(page.start_spin.value()) < 1e-9)
+        check("循环默认开启（空状态）", page.loop_switch.isChecked())
+        check("图案描边默认开启（空状态）", page.outline_check.isChecked())
+        check("保持比例默认开启（空状态）", page.keep_aspect_check.isChecked())
+
         # 没有音频时：印章框不出现（也就拖不动），滚轮缩放也不响应
         view = page.spectrum
         check("未载入时不显示印章框", not view._roi.isVisible())  # noqa: SLF001
@@ -157,6 +165,10 @@ def main() -> int:
         check("循环参数行常驻可见", page.loop_row.isVisible())
         check("上限显示为无限制", page.max_repeat_spin.text() == "无限制")
 
+        # 循环默认就是开着的 —— 打开软件就该是"印满整段"的状态
+        check("循环默认开启", page.loop_switch.isChecked())
+        check("job 里循环默认启用", page._collect_job().loop.enabled)  # noqa: SLF001
+
         # 一律通过控件摆框（用户实际会走的路径）——直接调 set_time_range 会绕过
         # 回写，控件与框就对不上了，后面的一致性检查也就失去意义
         duration = page.spectrum.duration_sec()
@@ -164,7 +176,12 @@ def main() -> int:
         page.start_spin.setValue(0.10)
         page.duration_spin.setValue(0.30)
         QApplication.processEvents()
-        check("循环关闭时不画影子", page.spectrum.loop_ghost_count() == 0)
+
+        page.loop_switch.setChecked(False)
+        QApplication.processEvents()
+        check("关掉循环后不画影子", page.spectrum.loop_ghost_count() == 0)
+        page.loop_switch.setChecked(True)
+        QApplication.processEvents()
 
         pos_x = page.spectrum._roi.pos().x()  # noqa: SLF001
         check("控件与框位置保持同步",
@@ -203,6 +220,182 @@ def main() -> int:
         page.duration_spin.setValue(0.30)
         QApplication.processEvents()
         snap("04_loop")
+
+    def step_outline() -> None:
+        """图案描边：外沿那一圈与本体反向，配色也跟着反过来。"""
+        view = page.spectrum
+        check("图案描边默认勾选", page.outline_check.isChecked())
+        check("job 里描边默认开启",
+              page._collect_job().pattern.outline)  # noqa: SLF001
+
+        check("描边图已算出", view._outline is not None)  # noqa: SLF001
+        check("描边叠层可见", view.outline_visible())
+        if view._outline is not None:  # noqa: SLF001
+            check("描边不与本体重叠",
+                  not (view._outline & view._pattern).any())  # noqa: SLF001
+
+        # 描边与本体共用同一个矩形 —— 同频段、同时间，只是处理方向相反
+        check("描边与本体同矩形",
+              view._outline_item.transform() == view._pattern_item.transform())  # noqa: SLF001
+
+        # 本体走衰减（暗色）时，描边该是亮色 —— 它朝反方向处理
+        page.engrave_segment.setCurrentItem("cut")
+        QApplication.processEvents()
+        main_lut = np.asarray(view._overlay_lut)[1]      # noqa: SLF001
+        ring_lut = np.asarray(view._outline_lut)[1]      # noqa: SLF001
+        check(f"衰减下描边用亮色（R={int(ring_lut[0])}）",
+              not np.array_equal(main_lut, ring_lut) and int(ring_lut[0]) > 100)
+
+        # 换成注入就反过来：本体亮、描边暗
+        page.engrave_segment.setCurrentItem("draw")
+        QApplication.processEvents()
+        dark = int(np.asarray(view._outline_lut)[1][0])  # noqa: SLF001
+        check(f"注入下描边转为暗色（R={dark}）", dark < 100)
+        page.engrave_segment.setCurrentItem("cut")
+        QApplication.processEvents()
+
+        # 影子：本体铺几份，描边就铺几份
+        check(f"描边影子与本体同数（{view.outline_ghost_count()}）",
+              view.outline_ghost_count() == view.loop_ghost_count() > 0)
+
+        # 关掉 → 描边叠层与影子一并消失，job 也跟着关
+        page.outline_check.setChecked(False)
+        QApplication.processEvents()
+        check("关掉后描边叠层消失", not view.outline_visible())
+        check("关掉后描边影子清空", view.outline_ghost_count() == 0)
+        check("关掉后 job 里也关掉",
+              not page._collect_job().pattern.outline)  # noqa: SLF001
+
+        page.outline_check.setChecked(True)
+        QApplication.processEvents()
+        check("重新开启后描边回来", view.outline_visible())
+
+    def step_guide_bands() -> None:
+        """推荐区与敏感区：同一个动作的两面，一起出现、一起收起。
+
+        两块都不常驻 —— 常驻会一直压在频谱上碍事。拖动印章框时亮出来，
+        停手约一秒后自动收起。
+        """
+        from ..ui.spectrogram import (
+            RECOMMENDED_BAND_HZ,
+            _SENSITIVE_HIDE_DELAY_MS,
+        )
+
+        view = page.spectrum
+        low, high = RECOMMENDED_BAND_HZ
+        roi = view._roi  # noqa: SLF001
+
+        check("静止时不显示推荐区", not view.recommended_band_visible())
+        check("静止时不显示敏感区", not view.sensitive_band_visible())
+
+        # 拖一下手柄，两块提示应当一起亮出来
+        roi.handleMoveStarted()
+        handle = [h for h in roi.handles
+                  if h["pos"].x() == 1.0 and h["pos"].y() == 0.5][0]
+        origin = roi.mapToParent(handle["pos"] * roi.state["size"])
+        roi.movePoint(handle["item"], origin + QPointF(30, 0), finish=False)
+        QApplication.processEvents()
+        check("拖动时两块提示一起出现", view.guide_bands_visible())
+        snap("07_guide_bands")
+
+        rect = view.recommended_band_rect()
+        check(f"推荐区域覆盖 {low / 1000:g}–{high / 1000:g} kHz",
+              abs(rect.y() - low) < 1.0
+              and abs(rect.y() + rect.height() - min(high, view._max_freq)) < 1.0)  # noqa: SLF001
+        check("推荐区域横贯整个时间轴",
+              abs(rect.x()) < 1e-6
+              and abs(rect.width() - view.duration_sec()) < 1e-6)
+
+        # 层级：色带压在本体之下（不能把图案染绿），文字提到本体之上（免得被盖住）
+        check("推荐色带在本体叠层之下",
+              view._recommended_band.z_value() < view._pattern_item.zValue())  # noqa: SLF001
+        check("推荐说明文字在本体之上",
+              view._recommended_text.zValue() > view._pattern_item.zValue())  # noqa: SLF001
+        check("推荐说明含提示语",
+              "相对安全" in view._recommended_text.toHtml())  # noqa: SLF001
+
+        # 两块提示都只描上下两道边界：左右两端的竖线已经被去掉
+        for name, band in (
+            ("推荐区", view._recommended_band),  # noqa: SLF001
+            *((f"敏感区{i}", b) for i, b in enumerate(view._sensitive_bands)),  # noqa: SLF001
+        ):
+            path = band._edges.path()  # noqa: SLF001
+            check(f"{name}只画上下两条边（{path.elementCount()} 个元素）",
+                  path.elementCount() == 4)      # 两条 moveTo + lineTo
+
+        QTest.qWait(_SENSITIVE_HIDE_DELAY_MS + 300)
+        check("停手后推荐区自动收起", not view.recommended_band_visible())
+        check("停手后敏感区也收起", not view.sensitive_band_visible())
+
+        # 采样率不够时上沿被 Nyquist 截断
+        saved = view._max_freq          # noqa: SLF001
+        view._max_freq = 11000.0        # noqa: SLF001
+        view._layout_recommended_band()  # noqa: SLF001
+        clipped = view.recommended_band_rect()
+        check("Nyquist 不够时上沿被截断",
+              abs(clipped.y() - low) < 1.0
+              and abs(clipped.y() + clipped.height() - 11000.0) < 1.0)
+
+        # 整段都在 Nyquist 之外就没有可推荐的频段
+        view._max_freq = 6000.0         # noqa: SLF001
+        check("整段越界时不摆出来",
+              not view._layout_recommended_band()  # noqa: SLF001
+              and view.recommended_band_rect().height() == 0.0)
+
+        view._max_freq = saved          # noqa: SLF001
+        view._layout_recommended_band()  # noqa: SLF001
+        QApplication.processEvents()
+
+    def step_keep_aspect() -> None:
+        """保持原始水印比例：时长由图案长宽比反推，手调被锁住。"""
+        view = page.spectrum
+        check("保持比例默认勾选", page.keep_aspect_check.isChecked())
+        check("勾选时时长框锁定", not page.duration_spin.isEnabled())
+
+        total = view.duration_sec()
+        height, width = view.pattern_shape()
+        low, high = page._current_freq_norm()            # noqa: SLF001
+        expected = (width / height) * (high - low) * view.viewport_aspect()
+        actual = view.time_range_sec()[1] / total
+        check(f"时长 = 图案比例算出的值（{actual:.3f} / 期望 {expected:.3f}）",
+              abs(actual - expected) < 0.01)
+
+        # 图案越"高"，比例越小，时长就该越短
+        page.text_edit.setPlainText("AB")
+        QApplication.processEvents()
+        wide = view.time_range_sec()[1]
+        page.text_edit.setPlainText("AB\nCD")
+        QApplication.processEvents()
+        tall = view.time_range_sec()[1]
+        check(f"图案越高时长越短（{tall:.2f}s < {wide:.2f}s）", tall < wide)
+        check("时长不超过音频总长", wide <= total + 1e-6)
+
+        page.text_edit.setPlainText("WATERMARK")
+        QApplication.processEvents()
+
+        # 关掉之后时长重新可以手调
+        page.keep_aspect_check.setChecked(False)
+        QApplication.processEvents()
+        check("取消勾选后时长框可用", page.duration_spin.isEnabled())
+        page.duration_spin.setValue(0.25)
+        QApplication.processEvents()
+        check("取消勾选后手调时长生效",
+              abs(view.time_range_sec()[1] - 0.25 * total) < 0.02)
+
+        page.keep_aspect_check.setChecked(True)
+        QApplication.processEvents()
+        aspect = view.time_range_sec()[1] / total
+        check(f"重新勾选后时长回到比例值（{aspect:.3f}）",
+              abs(aspect - expected) < 0.02)
+
+        # 换成「按秒」定位：数字换算成秒，但比例关系不该变
+        page.mode_combo.setCurrentIndex(1)
+        QApplication.processEvents()
+        seconds = view.time_range_sec()[1]
+        check(f"切到按秒后仍按比例算（{seconds:.2f}s）",
+              abs(seconds - expected * total) < 0.05)
+        page.mode_combo.setCurrentIndex(0)
+        QApplication.processEvents()
 
     def step_loop_consistency() -> None:
         """预览影子必须和 DSP 实际印刷的区间对得上。
@@ -273,11 +466,34 @@ def main() -> int:
         QApplication.processEvents()
 
     def step_help_page() -> None:
-        window.switchTo(window.help_page)
+        """使用说明：从底部按钮弹出 —— 侧边栏已经取消，不再有第二个页面。"""
+        from ..ui.main_window import HelpContent
+
+        check("窗口没有侧边导航栏", getattr(window, "navigationInterface", None) is None)
+        check("只装了批量处理一页", window.stackedWidget.count() == 1)
+        check("底部有「使用说明」按钮", page.help_button.text() == "使用说明")
+
+        page.help_button.click()
         QApplication.processEvents()
+        dialog = window._help_dialog  # noqa: SLF001
+        check("点击后弹出说明窗口", dialog is not None and dialog.isVisible())
+        check("窗口里装着说明内容",
+              dialog is not None and dialog.findChild(HelpContent) is not None)
+
+        # 再点一次不该又开一个
+        page.help_button.click()
+        QApplication.processEvents()
+        check("重复点击只带出同一个窗口",
+              window._help_dialog is dialog)  # noqa: SLF001
 
     def step_help_snap() -> None:
-        snap("05_help")
+        dialog = window._help_dialog  # noqa: SLF001
+        if dialog is not None and dialog.isVisible():
+            path = os.path.join(SHOT_DIR, "05_help.png")
+            dialog.grab().save(path)
+            shots.append(path)
+            dialog.close()
+            QApplication.processEvents()
 
     def step_collect_job() -> None:
         job = page._collect_job()  # noqa: SLF001
@@ -349,7 +565,6 @@ def main() -> int:
         """衰减 / 注入 切换要落到 DSP 的 mode 上。"""
         from ..core.params import EngraveMode
 
-        window.switchTo(window.batch_page)      # 截图要回主页面
         QApplication.processEvents()
 
         page.engrave_segment.setCurrentItem("cut")
@@ -780,9 +995,10 @@ def main() -> int:
     def step_window_center() -> None:
         """主窗口要有正确的默认尺寸，并摆在**主屏**正中。
 
-        尺寸这条曾经悄悄失效过：FluentWindow 的延迟初始化会把在 show() 之前
-        设的尺寸重置成 Qt 默认的 500x500，结果窗口顶着最小尺寸打开、右侧参数
-        被挤得显示不全。
+        尺寸这条曾经悄悄失效过：带导航栏的窗口基类会把 show() 之前设的尺寸
+        延迟重置成 Qt 默认的 500x500，结果窗口顶着最小尺寸打开、右侧参数被挤
+        得显示不全。现在换成不带导航栏的基类后那个行为没有了，这条继续留着
+        兜底 —— 尺寸本来就该是能验证的。
 
         期望位置用 primaryScreen 算，与实现保持一致 —— 多屏环境下
         ``window.screen()`` 可能指向副屏，拿它算会得出错误的位置。
@@ -792,6 +1008,15 @@ def main() -> int:
         screen = QApplication.primaryScreen().availableGeometry()
         window.apply_default_size()
         QApplication.processEvents()
+
+        # 程序名仍要设着（任务栏、Alt+Tab 靠它），但自绘标题栏里不显示 ——
+        # 左侧留空，只留右边那排窗口按钮
+        check(f"程序名仍设着（{window.windowTitle()!r}）",
+              window.windowTitle() == "频谱水印生成")
+        check("标题栏不显示 logo", not window.titleBar.iconLabel.isVisible())
+        check("标题栏不显示文字", not window.titleBar.titleLabel.isVisible())
+        check(f"标题栏铺满窗口宽（{window.titleBar.width()}）",
+              window.titleBar.width() == window.width())
 
         scale = min(
             1.0, screen.width() * 0.92 / 1440, screen.height() * 0.92 / 940
@@ -886,12 +1111,13 @@ def main() -> int:
 
     steps = [
         step_empty, step_add_files, step_after_preview, step_image_mode,
-        step_loop_on, step_help_page, step_help_snap, step_collect_job,
+        step_loop_on, step_outline, step_keep_aspect,
+        step_help_page, step_help_snap, step_collect_job,
         step_loop_consistency, step_region_bounds, step_zoom_behavior,
         step_pattern_overlay,
         step_engraving_mode, step_mode_advice, step_text_multiline_and_dblclick,
         step_drag_spinbox,
-        step_sensitive_band, step_roi_handles, step_drop_files,
+        step_sensitive_band, step_guide_bands, step_roi_handles, step_drop_files,
         step_axis_units, step_window_center, step_output_options,
         step_action_buttons,
     ]

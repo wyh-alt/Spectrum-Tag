@@ -14,8 +14,9 @@ from typing import Optional
 import numpy as np
 import pyqtgraph as pg
 from PyQt6.QtCore import QEvent, QPointF, QRect, QRectF, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QBrush, QColor, QFont, QFontMetrics, QPen
+from PyQt6.QtGui import QBrush, QColor, QFont, QFontMetrics, QPainterPath, QPen
 from PyQt6.QtWidgets import (
+    QGraphicsPathItem,
     QGraphicsRectItem,
     QTextEdit,
     QVBoxLayout,
@@ -40,6 +41,11 @@ from ..core.params import (
 SENSITIVE_BANDS: tuple[tuple[float, float], ...] = (
     (20.0, 5000.0),
 )
+
+# 推荐印刷区域 —— 与上面的敏感频段正好互补：低频不能碰（听见的都是它），
+# 超高频又留不住（转个码就被低通切掉），中间这一段才是水印的落脚点。
+# 和敏感频段一样只在拖动印章框时露面，两块提示一起出现、一起收起。
+RECOMMENDED_BAND_HZ = (7000.0, 13000.0)
 
 # 停手后提示再停留多久（毫秒）。拖动过程中每次变化都会重新计时。
 _SENSITIVE_HIDE_DELAY_MS = 900
@@ -180,6 +186,16 @@ def _build_overlay_lut(is_cut: bool, strength: float) -> np.ndarray:
     return lut
 
 
+def _build_outline_lut(is_cut: bool, strength: float) -> np.ndarray:
+    """图案描边用的色标 —— 取本体**相反**那一套。
+
+    描边是峰谷对里的另一半：本体在衰减（画成暗块）时它就在凸起（画成亮色），
+    本体在注入（亮色）时它就在衰减（暗块）。用相反的配色，一眼就能看出
+    "这一圈跟图案本体反着来"。
+    """
+    return _build_overlay_lut(not is_cut, strength)
+
+
 def db_to_rgb(db: np.ndarray, vmin: float, vmax: float) -> np.ndarray:
     """把 dB 矩阵映射成 ``(H, W, 3)`` 的 RGB 图。
 
@@ -300,6 +316,62 @@ class _SpectrogramViewBox(pg.ViewBox):
         super().wheelEvent(ev, axis)
 
 
+class _BandOverlay:
+    """一条横贯时间轴的提示带：半透明填充 + 上下两道边界线。
+
+    刻意**不画左右两条边** —— 带子横跨整个时间轴，左右本来就没有边界，
+    画出来只会是两端各一道扎眼的亮竖条。所以填充归矩形项、边界归一条
+    **开放**的折线：画笔沿着它走，到两端就停，不会拐下去。
+    """
+
+    def __init__(
+        self,
+        plot: pg.PlotWidget,
+        fill: QColor,
+        edge: QColor,
+        z: float,
+    ) -> None:
+        self._fill = QGraphicsRectItem()
+        self._fill.setBrush(QBrush(fill))
+        self._fill.setPen(QPen(Qt.PenStyle.NoPen))   # 只留填充，边框交给下面那条折线
+        self._fill.setZValue(z)
+        self._fill.setVisible(False)
+        plot.addItem(self._fill)
+
+        pen = QPen(edge)
+        pen.setStyle(Qt.PenStyle.DashLine)
+        pen.setWidth(2)
+        self._edges = QGraphicsPathItem()
+        self._edges.setPen(pen)
+        self._edges.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+        self._edges.setZValue(z)
+        self._edges.setVisible(False)
+        plot.addItem(self._edges)
+
+    def set_rect(self, rect: QRectF) -> None:
+        """摆放带子。空矩形（宽或高为 0）表示这一段用不上。"""
+        self._fill.setRect(rect)
+        path = QPainterPath()
+        if rect.width() > 0.0 and rect.height() > 0.0:
+            for y in (rect.top(), rect.bottom()):
+                path.moveTo(rect.left(), y)
+                path.lineTo(rect.right(), y)
+        self._edges.setPath(path)
+
+    def set_visible(self, visible: bool) -> None:
+        self._fill.setVisible(visible)
+        self._edges.setVisible(visible)
+
+    def is_visible(self) -> bool:
+        return self._fill.isVisible()
+
+    def rect(self) -> QRectF:
+        return self._fill.rect()
+
+    def z_value(self) -> float:
+        return self._fill.zValue()
+
+
 class SpectrogramView(QWidget):
     """时频图 + 印章框 + 图案叠加预览。"""
 
@@ -307,6 +379,7 @@ class SpectrogramView(QWidget):
     filesDropped = pyqtSignal(list)       # 拖入的本地文件路径
     patternDoubleClicked = pyqtSignal()   # 双击印章框，想改水印内容
     inlineTextChanged = pyqtSignal(str)   # 框内就地编辑时，每敲一个字都会发
+    viewResized = pyqtSignal()            # 绘图区尺寸变了（外部可能要重算时长）
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -317,9 +390,12 @@ class SpectrogramView(QWidget):
         self._has_audio = False
         self._updating = False          # 防止程序化改框触发回调风暴
         self._pattern: Optional[np.ndarray] = None
+        self._outline: Optional[np.ndarray] = None
 
-        # 循环印刷的影子框：只显示位置与图案，不参与交互
+        # 循环印刷的影子框：只显示位置与图案，不参与交互。
+        # 本体和描边各铺一套 —— 它们本来就是同一枚印章的两层。
         self._loop_items: list[pg.ImageItem] = []
+        self._outline_loop_items: list[pg.ImageItem] = []
         self._loop_enabled = False
         self._loop_interval = 5.0
 
@@ -354,12 +430,13 @@ class SpectrogramView(QWidget):
         # 图案叠加层：把二值图案半透明地画在框内，所见即所得
         # 初值只是占位，主窗口建好后会调 set_preview_style 按实际印法刷新
         self._overlay_lut = _build_overlay_lut(is_cut=True, strength=DEFAULT_CUT_STRENGTH)
-        self._pattern_item = pg.ImageItem()
-        self._pattern_item.setZValue(5)
-        self._pattern_item.setLookupTable(self._overlay_lut)
-        self._pattern_item.setVisible(False)
-        self._plot.addItem(self._pattern_item)
+        self._pattern_item = self._add_overlay_item(self._overlay_lut)
 
+        # 描边叠加层：与本体同样的矩形，但配色相反（它朝反方向处理）
+        self._outline_lut = _build_outline_lut(is_cut=True, strength=DEFAULT_CUT_STRENGTH)
+        self._outline_item = self._add_overlay_item(self._outline_lut)
+
+        self._build_recommended_band()
         self._build_sensitive_band()
 
         # 印章框：拖动框体平移，八个手柄调整尺寸。
@@ -400,28 +477,97 @@ class SpectrogramView(QWidget):
             # 到不了 item（实测调用 0 次）。所以在视口上直接拦。
             viewport.installEventFilter(self)
 
+    def _add_overlay_item(self, lut: np.ndarray) -> pg.ImageItem:
+        """新建一层图案叠层（图案本体与描边各一层）。"""
+        item = pg.ImageItem()
+        item.setZValue(5)
+        item.setLookupTable(lut)
+        item.setVisible(False)
+        self._plot.addItem(item)
+        return item
+
+    def _build_recommended_band(self) -> None:
+        """推荐印刷区域：一条横贯时间轴的淡绿色带 + 说明文字。
+
+        和敏感频段一样，只在调整印章框时亮出来（见 :meth:`_show_guide_bands`）——
+        常驻会一直压在频谱上，看久了反而碍事。
+
+        层级刻意排过：色带压在频谱之上、**图案叠层之下** —— 它横贯整个 7~13 kHz，
+        而水印通常就印在这一段，填充色绝不能把图案染绿。文字反过来提到最上层，
+        否则会被图案盖掉。
+        """
+        self._recommended_band = _BandOverlay(
+            self._plot,
+            fill=QColor(96, 220, 140, 34),
+            edge=QColor(96, 220, 140, 170),
+            z=1,
+        )
+
+        low, high = RECOMMENDED_BAND_HZ
+        self._recommended_text = pg.TextItem(
+            anchor=(0.5, 0.0),      # 以顶部中点为锚，文字从区域上沿往下展开
+            fill=pg.mkBrush(12, 32, 20, 190),
+            border=pg.mkPen(96, 220, 140, 130),
+        )
+        self._recommended_text.setHtml(
+            '<div style="text-align:center; line-height:150%;">'
+            '<span style="color:#7CE8A8; font-size:13px; font-weight:600;">'
+            f'推荐印刷区域 {low / 1000:g}–{high / 1000:g} kHz'
+            '</span><br>'
+            '<span style="color:#C8F0D8; font-size:11px;">'
+            '该频范围内印制水印相对安全，请合理控制图案尺寸！'
+            '</span>'
+            '</div>'
+        )
+        self._recommended_text.setZValue(7)
+        self._recommended_text.setVisible(False)
+        self._plot.addItem(self._recommended_text)
+
+    def _layout_recommended_band(self) -> bool:
+        """按当前音频的实际范围摆放推荐区域；这一段摆不下时返回 False。
+
+        采样率不够高时上沿会被 Nyquist 截断；整段都落在 Nyquist 之外
+        （比如 22.05 kHz 素材只有 11 kHz 可用）时就没有可推荐的频段了。
+        """
+        low, high = RECOMMENDED_BAND_HZ
+        top = min(high, self._max_freq)
+        bottom = min(low, top)
+        if not self._has_audio or top - bottom <= 0.0:
+            self._recommended_band.set_rect(QRectF())
+            return False
+        self._recommended_band.set_rect(
+            QRectF(0.0, bottom, self._duration, top - bottom)
+        )
+        self._recommended_text.setPos(self._duration * 0.5, top)
+        return True
+
+    def recommended_band_rect(self) -> QRectF:
+        """推荐区域当前的矩形（供自检使用）。"""
+        return self._recommended_band.rect()
+
+    def recommended_band_visible(self) -> bool:
+        """推荐区域当前是否可见（供自检使用）。"""
+        return self._recommended_band.is_visible()
+
     def _build_sensitive_band(self) -> None:
         """敏感频段提示：几片横贯时间轴的半透明黄带 + 中央说明。
 
         默认隐藏，只在调整印章框时亮出来。放置层级刻意排过：色带在频谱之上、
-        图案叠层之下（不挡住水印预览），而说明文字在最上层（不被图案盖掉）。
-        """
-        pen = QPen(QColor(255, 214, 90, 170))
-        pen.setStyle(Qt.PenStyle.DashLine)
-        pen.setWidth(2)
+        图案叠层之上（警告要看得见），而说明文字再高一层（不被色带压住）。
 
+        和推荐区域共用 :class:`_BandOverlay` —— 两者只是配色、层级和位置不同。
+        """
         # zValue 排在图案叠层（5）之上：否则色带会被水印图案从中间切断，
         # 看起来像两块无关的色块。填充只有 ~19% 不透明度，不会盖住图案本身。
-        self._sensitive_rects: list[QGraphicsRectItem] = []
-        for _ in SENSITIVE_BANDS:
-            rect = QGraphicsRectItem()
-            rect.setBrush(QBrush(QColor(255, 214, 90, 48)))
-            rect.setPen(pen)
-            rect.setZValue(6)
-            rect.setVisible(False)
-            self._plot.addItem(rect)
-            self._sensitive_rects.append(rect)
-        self._sensitive_rect = self._sensitive_rects[-1]   # 说明文字跟着它居中
+        self._sensitive_bands: list[_BandOverlay] = [
+            _BandOverlay(
+                self._plot,
+                fill=QColor(255, 214, 90, 48),
+                edge=QColor(255, 214, 90, 170),
+                z=6,
+            )
+            for _ in SENSITIVE_BANDS
+        ]
 
         # 频谱底色本身是暖色，纯黄文字对比度不够，垫一层深色底
         self._sensitive_text = pg.TextItem(
@@ -446,7 +592,7 @@ class SpectrogramView(QWidget):
         self._sensitive_timer = QTimer(self)
         self._sensitive_timer.setSingleShot(True)
         self._sensitive_timer.setInterval(_SENSITIVE_HIDE_DELAY_MS)
-        self._sensitive_timer.timeout.connect(self._hide_sensitive_band)
+        self._sensitive_timer.timeout.connect(self._hide_guide_bands)
 
     def _sync_axis_margins(self) -> None:
         """把两侧边距设成同一个值：刚好放得下最宽的刻度。
@@ -473,13 +619,13 @@ class SpectrogramView(QWidget):
         可提醒的，直接跳过（矩形置空）。参考文字跟着最后一片可见的色带居中。
         """
         anchor: Optional[tuple[float, float]] = None
-        for rect, (low, high) in zip(self._sensitive_rects, SENSITIVE_BANDS):
+        for band, (low, high) in zip(self._sensitive_bands, SENSITIVE_BANDS):
             top = min(high, self._max_freq)
             bottom = min(low, top)
             if top - bottom <= 0.0:
-                rect.setRect(QRectF())
+                band.set_rect(QRectF())
                 continue
-            rect.setRect(QRectF(0.0, bottom, self._duration, top - bottom))
+            band.set_rect(QRectF(0.0, bottom, self._duration, top - bottom))
             anchor = (bottom, top)
 
         if anchor is None:
@@ -489,28 +635,43 @@ class SpectrogramView(QWidget):
             self._duration * 0.5, anchor[0] + (anchor[1] - anchor[0]) * 0.5
         )
 
-    def _show_sensitive_band(self) -> None:
-        """亮出提示并重新计时 —— 拖动期间会被反复调用，所以提示不会中途消失。"""
+    def _show_guide_bands(self) -> None:
+        """亮出推荐区与敏感区，并重新计时。
+
+        两块提示是同一个动作的两面 —— "该印哪儿"和"别印哪儿" —— 所以一起
+        出现、一起收起。拖动期间这个函数会被反复调用，提示因此不会中途消失。
+        """
         if not self._has_audio:
             return
         self._layout_sensitive_band()
-        for rect in self._sensitive_rects:
-            rect.setVisible(True)
+        for band in self._sensitive_bands:
+            band.set_visible(True)
         self._sensitive_text.setVisible(True)
+
+        if self._layout_recommended_band():
+            self._recommended_band.set_visible(True)
+            self._recommended_text.setVisible(True)
+
         self._sensitive_timer.start()
 
-    def _hide_sensitive_band(self) -> None:
-        for rect in self._sensitive_rects:
-            rect.setVisible(False)
+    def _hide_guide_bands(self) -> None:
+        for band in self._sensitive_bands:
+            band.set_visible(False)
+        self._recommended_band.set_visible(False)
         self._sensitive_text.setVisible(False)
+        self._recommended_text.setVisible(False)
 
     def sensitive_band_visible(self) -> bool:
-        """提示当前是否可见（供自检使用）。"""
-        return bool(self._sensitive_rects) and self._sensitive_rects[0].isVisible()
+        """敏感提示当前是否可见（供自检使用）。"""
+        return bool(self._sensitive_bands) and self._sensitive_bands[0].is_visible()
 
     def sensitive_band_rects(self) -> list[QRectF]:
-        """各片提示带当前的矩形（供自检使用）。"""
-        return [rect.rect() for rect in self._sensitive_rects]
+        """各片敏感提示带当前的矩形（供自检使用）。"""
+        return [band.rect() for band in self._sensitive_bands]
+
+    def guide_bands_visible(self) -> bool:
+        """两块提示当前是否都亮着（供自检使用）。"""
+        return self.sensitive_band_visible() and self.recommended_band_visible()
 
     def _install_handles(self) -> None:
         """装上八个缩放手柄。
@@ -568,6 +729,7 @@ class SpectrogramView(QWidget):
         )
         self._hint.setVisible(False)
         self._layout_sensitive_band()
+        self._layout_recommended_band()
         self._queue_axis_margin_sync()   # 刻度文字随音频时长变化，边距要重新对齐
 
         # 有音频了才让印章框出现
@@ -578,51 +740,96 @@ class SpectrogramView(QWidget):
         self._image.clear()
         self._has_audio = False
         self._pattern_item.setVisible(False)
+        self._outline_item.setVisible(False)
         self._clear_loop_ghosts()
         self._roi.setVisible(False)
         self._sensitive_timer.stop()
-        self._hide_sensitive_band()
+        self._hide_guide_bands()
+        self._layout_recommended_band()   # 把矩形也清空，下次载入时不会闪一下旧的
         # 抹掉 extent，滚轮缩放会随之失效
         self._plot.getViewBox().set_full_extent(0.0, 0.0)
         self._hint.setVisible(True)
 
-    def set_pattern(self, pattern: Optional[np.ndarray]) -> None:
+    def set_pattern(
+        self,
+        pattern: Optional[np.ndarray],
+        outline: Optional[np.ndarray] = None,
+    ) -> None:
         """设置框内叠加显示的图案（布尔数组，True = 图案本体）。
 
         显示时纵向翻转 —— 图片顶部对应高频，与掩码栅格化的方向一致。
+        ``outline`` 是图案外沿那一圈（见 ``pattern.build_outline``），
+        与本体铺在同一个矩形里，只是配色相反。
         """
         if pattern is None or pattern.size == 0:
             self._pattern = None
+            self._outline = None
             self._pattern_item.setVisible(False)
+            self._outline_item.setVisible(False)
             self._clear_loop_ghosts()
             return
 
         self._pattern = pattern
-        # 行 0 = 图片顶部 = 最高频，而图像数组行 0 在最下方，故翻转
-        data = np.ascontiguousarray(pattern[::-1], dtype=np.uint8)
+        self._outline = outline if (outline is not None and outline.size) else None
         self._pattern_item.setImage(
-            data, axisOrder="row-major", autoLevels=False, levels=(0, 1)
+            self._flipped(pattern),
+            axisOrder="row-major", autoLevels=False, levels=(0, 1),
         )
+        if self._outline is not None:
+            self._outline_item.setImage(
+                self._flipped(self._outline),
+                axisOrder="row-major", autoLevels=False, levels=(0, 1),
+            )
         # 影子的贴图得跟着换，撤掉重建最省事（图案变化本来就不频繁）
         self._clear_loop_ghosts()
         self._update_pattern_rect()      # 可见性由它统一决定
         self._refresh_loop_ghosts()
+
+    def pattern_shape(self) -> Optional[tuple[int, int]]:
+        """当前图案的 ``(高, 宽)``；还没有图案时 None。
+
+        「保持原始水印比例」要靠它拿到图案的长宽比。
+        """
+        if self._pattern is None or self._pattern.size == 0:
+            return None
+        return int(self._pattern.shape[0]), int(self._pattern.shape[1])
+
+    def viewport_aspect(self) -> float:
+        """频谱绘图区的高宽比（高 / 宽）。
+
+        「保持原始水印比例」用它把频率跨度折成时间跨度：图案在频谱图上
+        看起来不变形，靠的就是这个比例。
+        """
+        rect = self._plot.getViewBox().geometry()
+        width, height = float(rect.width()), float(rect.height())
+        if width <= 1.0 or height <= 1.0:      # 还没布局完，退回整个视口
+            viewport = self._plot.viewport()
+            width, height = float(viewport.width()), float(viewport.height())
+        return max(1e-3, height / max(1.0, width))
 
     def _update_pattern_rect(self) -> None:
         """让图案叠层跟着印章框走。
 
         没有音频时不显示：此时印章框还没有有效的尺寸，叠层会被拉到默认的
         0~1 范围上，在空频谱里铺满一整屏。
+
+        描边层与本体同频段、同时间，所以矩形完全一致 —— 它俩本来就是同一枚
+        印章的两层，只是处理方向相反。
         """
         visible = self._pattern is not None and self._has_audio
         self._pattern_item.setVisible(visible)
         if not visible:
+            self._outline_item.setVisible(False)
             return
         pos = self._roi.pos()
         size = self._roi.size()
-        self._pattern_item.setRect(
-            QRectF(float(pos.x()), float(pos.y()), float(size.x()), float(size.y()))
+        rect = QRectF(
+            float(pos.x()), float(pos.y()), float(size.x()), float(size.y())
         )
+        self._pattern_item.setRect(rect)
+        self._outline_item.setVisible(self._outline is not None)
+        if self._outline is not None:
+            self._outline_item.setRect(rect)
 
     # ------------------------------------------------------------ 循环预览
 
@@ -631,11 +838,17 @@ class SpectrogramView(QWidget):
 
         第一个框和循环影子共用同一套色标 —— 它们本来就是同一个印章的多次印刷，
         深浅不一样只会让人以为哪里出了岔子。"哪个能调"靠边框和手柄区分就够了。
+
+        描边层取的是相反那一套：本体画成暗块时它亮，本体亮时它暗。
         """
         self._overlay_lut = _build_overlay_lut(bool(is_cut), float(strength))
+        self._outline_lut = _build_outline_lut(bool(is_cut), float(strength))
         self._pattern_item.setLookupTable(self._overlay_lut)
+        self._outline_item.setLookupTable(self._outline_lut)
         for item in self._loop_items:
             item.setLookupTable(self._overlay_lut)
+        for item in self._outline_loop_items:
+            item.setLookupTable(self._outline_lut)
 
     def set_loop_preview(self, enabled: bool, interval_sec: float) -> None:
         """告诉视图当前的循环设置，它会据此铺出一串只读的影子框。"""
@@ -646,6 +859,14 @@ class SpectrogramView(QWidget):
     def loop_ghost_count(self) -> int:
         """当前画了几个循环影子（供自检使用）。"""
         return len(self._loop_items)
+
+    def outline_ghost_count(self) -> int:
+        """描边层画了几个循环影子（供自检使用）。"""
+        return len(self._outline_loop_items)
+
+    def outline_visible(self) -> bool:
+        """描边叠层是否可见（供自检使用）。"""
+        return self._outline_item.isVisible()
 
     def _loop_positions(self) -> list[float]:
         """算出后续各次印刷的起始时间（秒）。
@@ -670,22 +891,55 @@ class SpectrogramView(QWidget):
             x += step
         return positions
 
-    def _ghost_image_data(self) -> Optional[np.ndarray]:
-        if self._pattern is None or not self._pattern.size:
+    @staticmethod
+    def _flipped(pattern: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        """行 0 = 图片顶部 = 最高频，而图像数组行 0 在最下方，故翻转。"""
+        if pattern is None or not pattern.size:
             return None
-        # 行 0 = 图片顶部 = 最高频，与主叠层一样翻转
-        return np.ascontiguousarray(self._pattern[::-1], dtype=np.uint8)
+        return np.ascontiguousarray(pattern[::-1], dtype=np.uint8)
+
+    def _ghost_image_data(self) -> Optional[np.ndarray]:
+        return self._flipped(self._pattern)
 
     def _clear_loop_ghosts(self) -> None:
-        for item in self._loop_items:
-            self._plot.removeItem(item)
-        self._loop_items.clear()
+        for items in (self._loop_items, self._outline_loop_items):
+            for item in items:
+                self._plot.removeItem(item)
+            items.clear()
+
+    def _sync_ghost_row(
+        self,
+        items: list[pg.ImageItem],
+        positions: list[float],
+        data: np.ndarray,
+        lut: np.ndarray,
+        rect: QRectF,
+    ) -> None:
+        """把一排影子框铺到给定位置上（矩形由调用方算好，只挪 x）。
+
+        已有条目复用，只更新矩形，避免每次拖动都重传一次纹理。
+        """
+        while len(items) > len(positions):
+            self._plot.removeItem(items.pop())
+
+        while len(items) < len(positions):
+            item = pg.ImageItem()
+            # 与对应的印章共用色标，不另外调 opacity —— 深浅该由强度决定，
+            # 不该因为"这是循环的影子"就无端淡一半
+            item.setLookupTable(lut)
+            item.setZValue(5)
+            item.setImage(data, axisOrder="row-major", autoLevels=False, levels=(0, 1))
+            self._plot.addItem(item)
+            items.append(item)
+
+        for item, x in zip(items, positions):
+            item.setLookupTable(lut)
+            item.setRect(QRectF(x, rect.y(), rect.width(), rect.height()))
 
     def _refresh_loop_ghosts(self) -> None:
-        """按循环间隔铺一串影子框。
+        """按循环间隔铺一串影子框 —— 图案本体和描边各铺一套。
 
         影子只反映位置和图案，拖不动 —— 它们跟着第一个框和间隔走。
-        已有条目会复用，只更新矩形，避免每次拖动都重传一次纹理。
         """
         positions = self._loop_positions()
         data = self._ghost_image_data()
@@ -694,24 +948,21 @@ class SpectrogramView(QWidget):
             self._clear_loop_ghosts()
             return
 
-        while len(self._loop_items) > len(positions):
-            self._plot.removeItem(self._loop_items.pop())
-
-        while len(self._loop_items) < len(positions):
-            item = pg.ImageItem()
-            # 与第一个框共用色标，不另外调 opacity —— 深浅该由强度决定，
-            # 不该因为"这是循环的影子"就无端淡一半
-            item.setLookupTable(self._overlay_lut)
-            item.setZValue(5)
-            item.setImage(data, axisOrder="row-major", autoLevels=False, levels=(0, 1))
-            self._plot.addItem(item)
-            self._loop_items.append(item)
-
         pos = self._roi.pos()
         size = self._roi.size()
-        rect = (float(pos.y()), float(size.x()), float(size.y()))
-        for item, x in zip(self._loop_items, positions):
-            item.setRect(QRectF(x, rect[0], rect[1], rect[2]))
+        rect = QRectF(0.0, float(pos.y()), float(size.x()), float(size.y()))
+        self._sync_ghost_row(
+            self._loop_items, positions, data, self._overlay_lut, rect,
+        )
+
+        outline_data = self._flipped(self._outline)
+        self._sync_ghost_row(
+            self._outline_loop_items,
+            positions if outline_data is not None else [],
+            outline_data if outline_data is not None else data,
+            self._outline_lut,
+            rect,
+        )
 
     # ---------------------------------------------------------------- 印章框
 
@@ -796,7 +1047,7 @@ class SpectrogramView(QWidget):
             # 程序化设几何（含载入文件时的初始化）不弹敏感频段提示 ——
             # 那个提示是给"手动拖框"这个动作配的。
             return
-        self._show_sensitive_band()
+        self._show_guide_bands()
         self._clamp_region()
         self.regionChanged.emit()
 
@@ -845,6 +1096,8 @@ class SpectrogramView(QWidget):
         self._hint.setGeometry(self.rect())
         self._position_inline_edit()
         self._queue_axis_margin_sync()
+        # 视口高宽比变了，「保持原始水印比例」算出来的时长要跟着重算
+        self.viewResized.emit()
 
     # ------------------------------------------------------------ 就地编辑
 

@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import platform
 from functools import lru_cache
@@ -28,6 +29,18 @@ _MAX_SIDE = 2048
 
 # 图片二值化的透明像素阈值：透明占比 > 1/20 时改用 alpha 通道
 _ALPHA_MODE_DIVISOR = 20
+
+# 图案描边的宽度，占图案**较短边**的比例。
+#
+# 取短边而不是最长边：图案铺满印章框后，短边对应的是频率方向 —— 那一头
+# 范围有限，也是描边最容易把图案吃掉的方位。按最长边定宽时，宽扁的单行
+# 文字（"WATERMARK" 高只有 285 像素）会算出 41 像素的半径，比字高的一半
+# 还多，字母之间的空隙全被填满，描边反而盖过本体，水印看起来成了负形。
+_OUTLINE_WIDTH_RATIO = 0.03
+
+# 算描边时把图案缩到的最长边。描边只是一圈轮廓，没有细节可言，而膨胀的
+# 开销与像素数成正比 —— 大图案上缩着算能快一个数量级，误差不到一个采样格。
+_OUTLINE_WORK_MAX = 512
 
 # 文字渲染的目标尺寸（最长边像素）。图案最终会被拉伸铺满掩码网格，
 # 先在足够大的画布上渲染，栅格化时才不会丢细节。
@@ -246,5 +259,83 @@ def build_pattern(spec: PatternSpec) -> np.ndarray:
     if not pattern.any():
         raise PatternError("图案为空：二值化后没有任何有效像素，请调整阈值或换张图")
     return pattern
+
+
+def _dilate(mask: np.ndarray, radius: int) -> np.ndarray:
+    """二值图向外扩张 radius 个像素（方形结构元）。
+
+    两个方向各扫一遍，每遍在前缀和上判断"窗口里有没有本体" —— 逐轮移位
+    要跑 radius 遍全图，2048 宽的图案上描边有几十像素，那样太慢。
+    """
+    if radius <= 0:
+        return mask
+    grown = mask
+    for axis in (0, 1):
+        n = grown.shape[axis]
+        if n <= 1:
+            continue
+        # c[i] = 前 i 个元素里本体的个数；窗口和 > 0 即窗口内存在本体
+        prefix = np.concatenate(
+            [
+                np.zeros_like(grown.take([0], axis=axis), dtype=np.int32),
+                np.cumsum(grown, axis=axis, dtype=np.int32),
+            ],
+            axis=axis,
+        )
+        lo = np.maximum(np.arange(n) - radius, 0)
+        hi = np.minimum(np.arange(n) + radius + 1, n)
+        grown = (prefix.take(hi, axis=axis) - prefix.take(lo, axis=axis)) > 0
+    return grown
+
+
+def _pool_or(mask: np.ndarray, step: int) -> np.ndarray:
+    """把 ``step×step`` 的块压成一个像素：块内有本体就算 True。
+
+    用"有没有"而不是平均值 —— 细笔画（一两个像素宽的横竖）取平均会直接
+    消失，取"有没有"最多让它粗一点。
+    """
+    h, w = mask.shape
+    pad_h, pad_w = (-h) % step, (-w) % step
+    if pad_h or pad_w:
+        mask = np.pad(mask, ((0, pad_h), (0, pad_w)), constant_values=False)
+    hh, ww = mask.shape
+    return mask.reshape(hh // step, step, ww // step, step).any(axis=(1, 3))
+
+
+def build_outline(pattern: np.ndarray) -> np.ndarray:
+    """图案的描边带 —— 本体向外扩一圈之后挖掉本体。
+
+    这一圈就是"峰谷对"里的另一半：本体被削弱（或注入）时，它反向处理，
+    于是想抹平图案就得连这圈一起动，而一动这圈图案又露出来。
+
+    宽度取图案**较短边**的 :data:`_OUTLINE_WIDTH_RATIO`（见那里的说明）：图案会被
+    拉伸铺满印章框，所以按比例定宽，描边跟着一起缩放，粗细在成品里是恒定的
+    —— 始终等于印章框频率跨度的 3%。
+
+    大图案先缩到 :data:`_OUTLINE_WORK_MAX` 再膨胀。膨胀的开销与像素数成正比，
+    2048² 的全分辨率上要近百毫秒，而它挂在每次按键与滑杆拖动上 —— 描边只是
+    一圈轮廓、本来就没有细节，缩着算的误差不超过一个采样格。
+    """
+    if not pattern.any():
+        return pattern
+
+    h, w = pattern.shape
+    longest, shortest = max(h, w), min(h, w)
+    radius = max(1, int(round(shortest * _OUTLINE_WIDTH_RATIO)))
+
+    step = max(1, int(math.ceil(longest / _OUTLINE_WORK_MAX)))
+    # 半径本来就不大的话，缩得越狠、量化误差占的比例越大（9 像素的描边
+    # 缩 5 倍只剩不到 2 像素，回来就面目全非了）—— 宁可多算一点
+    step = min(step, max(1, radius // 3))
+    if step == 1:
+        return _dilate(pattern, radius) & ~pattern
+
+    # 缩到工作尺寸上膨胀，再原样放大回去。池化本身已经让图案胖了最多
+    # step-1 个像素，算半径时把这一圈扣掉。
+    small = _pool_or(pattern, step)
+    small_radius = max(1, int(round(radius / step)) - 1)
+    grown = _dilate(small, small_radius)
+    grown = np.repeat(np.repeat(grown, step, axis=0), step, axis=1)[:h, :w]
+    return grown & ~pattern
 
 

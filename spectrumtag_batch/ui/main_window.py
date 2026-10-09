@@ -12,6 +12,7 @@ from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QDialog,
     QFileDialog,
     QFrame,
     QHBoxLayout,
@@ -24,8 +25,7 @@ from qfluentwidgets import (
     BodyLabel,
     CardWidget,
     CheckBox,
-    FluentIcon,
-    FluentWindow,
+    FluentTitleBar,
     InfoBar,
     InfoBarPosition,
     ListWidget,
@@ -36,8 +36,10 @@ from qfluentwidgets import (
     StrongBodyLabel,
     SwitchButton,
     TextEdit,
-    TitleLabel,
 )
+
+# 无导航栏的窗口基类只在这里导出，顶层没转出来
+from qfluentwidgets.window.fluent_window import FluentWindowBase
 
 from ..batch import (
     SUPPORTED_EXTENSIONS,
@@ -50,6 +52,8 @@ from ..batch import (
 from ..core.params import (
     DEFAULT_CUT_STRENGTH,
     DEFAULT_DRAW_STRENGTH,
+    DEFAULT_HIGH_FREQ_HZ,
+    DEFAULT_LOW_FREQ_HZ,
     FFT_SIZE_CHOICES,
     AudioFormat,
     DspSpec,
@@ -63,7 +67,7 @@ from ..core.params import (
     RenderJob,
     VideoFormat,
 )
-from ..core.pattern import PatternError, build_pattern
+from ..core.pattern import PatternError, build_outline, build_pattern
 from ..media.audio_io import MediaError, read_audio
 from ..media.video_io import find_ffmpeg, is_video_file
 from .spectrogram import SpectrogramView
@@ -104,6 +108,17 @@ ADVICE_OVERLAP_RATIO = 0.5
 
 # 拖动停下多久之后才给建议 —— 拖的过程中弹模态框会打断操作，而且会连弹好几次
 _ADVICE_DELAY_MS = 600
+
+# 窗口尺寸变化后等多久再重算「保持原始水印比例」的时长。
+# 拖窗口边框会连发几十次 resize，逐次重算纯属浪费。
+_ASPECT_DELAY_MS = 150
+
+# 「保持原始水印比例」算出来的时长下限（占音频总长的比例）——
+# 频率框压得极扁时比例会趋近 0，留一点余量免得印章短到印不出来
+_MIN_ASPECT_DURATION = 0.002
+
+# 内容区左右留白（每张卡片自己另有 16 的内边距）
+_CONTENT_PADDING_X = 28
 
 # 输出格式下拉项。顺序即下拉里的顺序，第一项都是"与源一致"。
 _AUDIO_FORMATS = (
@@ -221,7 +236,9 @@ class BatchWorker(QThread):
 
 
 class BatchPage(QWidget):
-    """批量处理主页面。"""
+    """批量处理主页面 —— 也是这个窗口唯一的一页。"""
+
+    helpRequested = pyqtSignal()        # 点了「使用说明」
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -235,6 +252,7 @@ class BatchPage(QWidget):
         self._batch_worker: Optional[BatchWorker] = None
         self._pattern_cache: dict = {}
         self._syncing = False
+        self._aspect_applying = False    # 正在按比例改时长，别被自己的回灌打断
 
         # 印法建议：同一文件同一类建议只提一次，换文件后重新允许
         self._advised_for = ""
@@ -246,10 +264,19 @@ class BatchPage(QWidget):
 
         self.setAcceptDrops(True)       # 整个页面都能接文件，不只是输入框
 
+        # 「保持原始水印比例」的时长重算去抖：视口比例变了才需要重来
+        self._aspect_timer = QTimer(self)
+        self._aspect_timer.setSingleShot(True)
+        self._aspect_timer.setInterval(_ASPECT_DELAY_MS)
+        self._aspect_timer.timeout.connect(self._apply_aspect_duration)
+
         self._build_ui()
         self._connect_signals()
         self._refresh_pattern()
         self._on_engrave_changed()      # 让预览配色与初始模式（衰减）一致
+        # 循环默认是开的，得主动同步一次 —— setChecked 发生在连信号之前，
+        # 那个 checkedChanged 没人接
+        self._sync_loop_preview()
         # 合成视频默认是开的，得主动同步一次 —— setChecked 发生在连信号之前，
         # 那个 checkedChanged 没人接
         self._on_mux_toggled(self.mux_switch.isChecked())
@@ -266,10 +293,15 @@ class BatchPage(QWidget):
         # 保持同一条右边线，视觉上不会出现"下宽上窄"的错位。
         content = QWidget(self)
         content_layout = QHBoxLayout(content)
-        content_layout.setContentsMargins(28, 16, 28, 20)
+        content_layout.setContentsMargins(
+            _CONTENT_PADDING_X, 16, _CONTENT_PADDING_X, 20
+        )
         content_layout.setSpacing(16)
 
         left = QWidget(content)
+        # 同理给左列兜底：文件列表头部那一排按钮（添加文件 / 添加文件夹 /
+        # 移除选中 / 清空）挤到一定程度就会互相压住。
+        left.setMinimumWidth(500)
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(12)
@@ -280,6 +312,9 @@ class BatchPage(QWidget):
 
         # 右列：参数区（伸缩）+ 进度 + 操作按钮 —— 按钮紧贴它所依赖的参数下方
         right = QWidget(content)
+        # 参数列压不得：里面的数值框和复选框挤到一定程度就会截断数字、切掉
+        # 文字（横滚条又是关着的）。给它一个下限，窗口变窄时先收左列。
+        right.setMinimumWidth(460)
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.setSpacing(12)
@@ -293,11 +328,18 @@ class BatchPage(QWidget):
         root.addWidget(content, 1)
 
     def _build_action_row(self, parent: QWidget) -> QWidget:
-        """底部操作区：只处理当前选中文件 / 处理整批。两个都靠右，主操作在最右。"""
+        """底部操作区：使用说明在最左，两个处理按钮靠右、主操作在最右。
+
+        说明按钮占的正是"最不碍事"的那个角 —— 它不参与主流程，离主操作
+        越远越好，免得跟"处理所有文件"抢注意力。
+        """
         row = QWidget(parent)
         layout = QHBoxLayout(row)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(10)
+
+        self.help_button = PushButton("使用说明", row)
+        self.help_button.setMinimumHeight(36)
 
         self.process_current_button = PushButton("只处理当前文件", row)
         self.process_current_button.setMinimumHeight(36)
@@ -306,6 +348,7 @@ class BatchPage(QWidget):
         self.process_all_button.setMinimumWidth(150)
         self.process_all_button.setMinimumHeight(36)
 
+        layout.addWidget(self.help_button)
         layout.addStretch(1)
         layout.addWidget(self.process_current_button)
         layout.addWidget(self.process_all_button)
@@ -397,7 +440,31 @@ class BatchPage(QWidget):
 
         self.invert_pattern_check = CheckBox("反转图案明暗")
         self.invert_pattern_check.setToolTip("适配黑底 / 白底的素材")
-        self.options_row = OptionRow(self.invert_pattern_check, parent=card)
+
+        # 图案描边：外沿再描一圈反向处理，与图案本体配成峰谷对
+        self.outline_check = CheckBox("图案描边")
+        self.outline_check.setChecked(True)
+        self.outline_check.setToolTip(
+            "沿图案外沿描一圈，朝「反方向」处理，与本体配成峰谷对：\n"
+            "衰减时外圈凸起，注入时外圈凹陷。\n"
+            "想抹平图案就得连外圈一起动，而外圈一动图案又露出来 ——\n"
+            "两头的代价互相牵制，大幅抬高去除成本。"
+        )
+
+        # 保持原始水印比例：时长不再由用户直接给，而是按图案长宽比反推
+        self.keep_aspect_check = CheckBox("保持原始水印比例")
+        self.keep_aspect_check.setChecked(True)
+        self.keep_aspect_check.setToolTip(
+            "时长按图案的长宽比自动调节，图案不被拉伸变形。\n"
+            "关掉之后时长重新可以手调，代价是图案会被拉伸铺满整个框。"
+        )
+
+        self.options_row = OptionRow(
+            self.invert_pattern_check,
+            self.outline_check,
+            self.keep_aspect_check,
+            parent=card,
+        )
         layout.addWidget(self.options_row)
 
         # 印发方式紧跟在图案之后 —— 这是选完图案后紧接着要做的决定
@@ -435,15 +502,23 @@ class BatchPage(QWidget):
         layout.setSpacing(8)
         layout.addWidget(StrongBodyLabel("位置与尺寸", card))
 
-        self.low_freq_spin = create_compact_spinbox(0, 22050, 1100, decimals=0, step=50, suffix="Hz", width=104)
-        self.high_freq_spin = create_compact_spinbox(0, 22050, 9900, decimals=0, step=50, suffix="Hz", width=104)
+        # 频率框比其它数值框宽一点：要放得下 "10500 Hz" 这种五位数带单位
+        self.low_freq_spin = create_compact_spinbox(
+            0, 22050, DEFAULT_LOW_FREQ_HZ, decimals=0, step=50, suffix="Hz", width=116
+        )
+        self.high_freq_spin = create_compact_spinbox(
+            0, 22050, DEFAULT_HIGH_FREQ_HZ, decimals=0, step=50, suffix="Hz", width=116
+        )
         layout.addWidget(labeled_row(("低频", self.low_freq_spin), ("高频", self.high_freq_spin)))
 
         self.mode_combo = create_compact_combo(["按比例", "按秒"], width=96)
         layout.addWidget(labeled_row(("定位", self.mode_combo)))
 
-        self.start_spin = create_compact_spinbox(0, 3600, 0.10, decimals=3, step=0.05, width=104)
+        self.start_spin = create_compact_spinbox(0, 3600, 0.0, decimals=3, step=0.05, width=104)
         self.duration_spin = create_compact_spinbox(0.001, 3600, 0.30, decimals=3, step=0.05, width=104)
+        # 保持比例时它由图案长宽比反推，手改也会被立刻覆盖 —— 索性锁上
+        self.duration_spin.setEnabled(not self.keep_aspect_check.isChecked())
+        self.duration_spin.setToolTip("勾选「保持原始水印比例」时，时长由图案比例自动决定")
         layout.addWidget(labeled_row(("起点", self.start_spin), ("时长", self.duration_spin)))
         return card
 
@@ -461,6 +536,7 @@ class BatchPage(QWidget):
         self.loop_switch = SwitchButton(header)
         self.loop_switch.setOnText("")      # 开关自己就能表示状态，不必再标 On/Off
         self.loop_switch.setOffText("")
+        self.loop_switch.setChecked(True)   # 默认就循环印满整段
         header_layout.addWidget(self.loop_switch)
         layout.addWidget(header)
 
@@ -571,6 +647,9 @@ class BatchPage(QWidget):
         self.image_edit.textChanged.connect(self._refresh_pattern)
         self.invert_pattern_check.stateChanged.connect(self._refresh_pattern)
 
+        self.outline_check.stateChanged.connect(self._refresh_pattern)
+        self.keep_aspect_check.stateChanged.connect(self._on_keep_aspect_toggled)
+
         self.engrave_segment.currentItemChanged.connect(self._on_engrave_changed)
         self.strength_slider.valueChanged.connect(self._on_strength_changed)
         self.mux_switch.checkedChanged.connect(self._on_mux_toggled)
@@ -580,6 +659,7 @@ class BatchPage(QWidget):
         self.mode_combo.currentIndexChanged.connect(self._on_position_mode_changed)
 
         self.spectrum.regionChanged.connect(self._on_region_changed)
+        self.spectrum.viewResized.connect(self._aspect_timer.start)
         self.spectrum.filesDropped.connect(self._add_paths)
         self.spectrum.patternDoubleClicked.connect(self._on_pattern_double_clicked)
         self.spectrum.inlineTextChanged.connect(self._on_inline_text_changed)
@@ -589,6 +669,7 @@ class BatchPage(QWidget):
         self.duration_spin.valueChanged.connect(self._on_time_edited)
         self.fft_combo.currentIndexChanged.connect(self._on_fft_changed)
 
+        self.help_button.clicked.connect(self.helpRequested)
         self._add_files_btn.clicked.connect(self._pick_files)
         self._add_folder_btn.clicked.connect(self._pick_folder)
         self.remove_btn.clicked.connect(self._remove_selected)
@@ -603,17 +684,20 @@ class BatchPage(QWidget):
 
     def _pattern_spec(self) -> PatternSpec:
         """从界面读出图案设置。"""
+        outline = self.outline_check.isChecked()
         if self.pattern_segment.currentRouteKey() == "image":
             return PatternSpec(
                 source=PatternSource.IMAGE,
                 image_path=self.image_edit.text().strip() or None,
                 invert_pattern=self.invert_pattern_check.isChecked(),
+                outline=outline,
             )
         return PatternSpec(
             source=PatternSource.TEXT,
             text=self.text_edit.toPlainText(),
             weight=self.weight_slider.value(),
             invert_pattern=self.invert_pattern_check.isChecked(),
+            outline=outline,
         )
 
     def _on_pattern_source_changed(self) -> None:
@@ -652,6 +736,7 @@ class BatchPage(QWidget):
         spec = self._pattern_spec()
         try:
             pattern = build_pattern(spec)
+            outline = build_outline(pattern) if spec.outline else None
         except PatternError as exc:
             self.spectrum.set_pattern(None)
             self.pattern_info.setText(f"⚠ {exc}")
@@ -659,8 +744,67 @@ class BatchPage(QWidget):
             return
 
         self._pattern_cache.clear()          # 图案变了，缓存作废
-        self.spectrum.set_pattern(pattern)
+        self.spectrum.set_pattern(pattern, outline)
         self.pattern_info.setVisible(False)
+        # 图案换了，长宽比跟着变 —— 保持比例时时长要重算
+        self._apply_aspect_duration()
+
+    def _on_keep_aspect_toggled(self) -> None:
+        """勾上就锁住时长输入框 —— 它马上会被按比例算出的值覆盖，留着能改只会让人困惑。"""
+        self.duration_spin.setEnabled(not self.keep_aspect_check.isChecked())
+        self._apply_aspect_duration()
+
+    def _apply_aspect_duration(self) -> None:
+        """「保持原始水印比例」：按图案长宽比反推印章时长。
+
+        图案最终会被拉伸铺满整个印章框，所以"比例"只可能是**显示坐标**下的
+        比例 —— 让框在频谱图上的像素宽高比等于图案自身的宽高比，看起来才跟
+        原图一致。频率跨度由用户定死，时长于是被唯一确定：
+
+            时长/总时长 = (图案宽/图案高) × 频率跨度(归一化) × (绘图区高/宽)
+
+        绘图区比例参与其中，所以窗口大小一变就得重算 —— 这正是"所见即所得"
+        该有的代价：预览里看到的形状，就是导出后频谱上的形状。
+
+        未勾选、没有音频、图案还没渲染出来，或已经在应用途中时什么都不做。
+        """
+        if (
+            self._aspect_applying
+            or not self.keep_aspect_check.isChecked()
+            or not self.spectrum.has_audio()
+        ):
+            return
+
+        shape = self.spectrum.pattern_shape()
+        if shape is None:
+            return
+        height, width = shape
+        low, high = self._current_freq_norm()
+        span = high - low
+        if height <= 0 or width <= 0 or span <= 0.0:
+            return
+
+        norm = (width / height) * span * self.spectrum.viewport_aspect()
+        norm = max(_MIN_ASPECT_DURATION, min(1.0, norm))
+
+        total = self._preview_total_seconds()
+        is_absolute = self.mode_combo.currentIndex() == 1
+        # 起点直接取框当前的位置，不走输入框 —— 输入框是四舍五入过的，
+        # 拿它回写会让框一点点漂移，每漂一次又触发一轮回调，成了死循环
+        start_sec = self.spectrum.time_range_sec()[0]
+
+        self._aspect_applying = True
+        try:
+            self._syncing = True
+            try:
+                self.duration_spin.setValue(
+                    round(norm * total if is_absolute else norm, 3)
+                )
+            finally:
+                self._syncing = False
+            self.spectrum.set_time_range(start_sec, norm * total)
+        finally:
+            self._aspect_applying = False
 
     def _engrave_mode(self) -> EngraveMode:
         return (
@@ -745,6 +889,8 @@ class BatchPage(QWidget):
                 self.duration_spin.setSuffix("")
         finally:
             self._syncing = False
+        # 换算后时长要按新单位重算（保持比例时它由图案比例定，不跟着换算走）
+        self._apply_aspect_duration()
 
     def _on_fft_changed(self) -> None:
         if self._preview_samples is not None:
@@ -829,7 +975,7 @@ class BatchPage(QWidget):
 
     def _on_region_changed(self) -> None:
         """印章框被拖动 → 回写频率与时间控件。"""
-        if self._syncing or not self.spectrum.has_audio():
+        if self._aspect_applying or self._syncing or not self.spectrum.has_audio():
             return
         low_norm, high_norm = self.spectrum.freq_range_norm()
         start_sec, duration_sec = self.spectrum.time_range_sec()
@@ -851,6 +997,10 @@ class BatchPage(QWidget):
         finally:
             self._syncing = False
 
+        # 拖上下边改了频率跨度 → 保持比例时时长要跟着重算；
+        # 拖左右边改了宽度 → 会被算出来的值顶回去，宽度于是拖不动
+        self._apply_aspect_duration()
+
         # 等拖动停下来再判断要不要给建议 —— 拖动过程中弹模态框会打断操作
         self._advice_timer.start()
 
@@ -869,6 +1019,7 @@ class BatchPage(QWidget):
             self.spectrum.set_freq_range(low, high)
         finally:
             self._syncing = False
+        self._apply_aspect_duration()
 
     def _on_time_edited(self) -> None:
         if self._syncing or not self.spectrum.has_audio():
@@ -1063,6 +1214,10 @@ class BatchPage(QWidget):
         else:
             start, dur = self.start_spin.value() * total, self.duration_spin.value() * total
         self.spectrum.set_time_range(start, dur)
+
+        # 换了素材：时长按新音频重新校准（保持比例时它就是新总长的比例值）
+        self._aspect_timer.stop()        # 载入过程里的 resize 通知已经过时了
+        self._apply_aspect_duration()
 
     def _current_freq_norm(self) -> tuple[float, float]:
         max_hz = self._preview_rate / 2.0 if self._preview_rate else 22050.0
@@ -1259,55 +1414,46 @@ class BatchPage(QWidget):
             )
 
 
-class HelpPage(QWidget):
-    """使用说明页。"""
+class HelpContent(QWidget):
+    """使用说明的内容本体 —— 装在 :class:`HelpDialog` 里。
+
+    它曾经是侧边栏里的一页；侧边栏去掉之后，同一份内容换成弹窗，
+    免得为它单独占一块常驻的地方。
+    """
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
-        self.setObjectName("helpPage")
+        self.setObjectName("helpContent")
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(36, 24, 36, 24)
+        layout.setContentsMargins(20, 16, 20, 20)
         layout.setSpacing(14)
 
-        layout.addWidget(TitleLabel("使用说明", self))
         layout.addWidget(self._card("三步上手", [
-            "1. 把音频（或视频）文件、文件夹拖到窗口任意位置，列表会列出所有可处理的文件。",
-            "2. 在左侧频谱图上拖动黄色印章框：上下边决定水印落在哪些频率，左右边决定印在什么时间。"
-            "框内会实时显示图案的实际形状；拖动时还会浮出 20 Hz–5 kHz 的敏感频段提示，"
-            "提醒这一段印水印最容易影响听感。",
-            "3. 点右下角「处理所有文件」导出整批；只想先试一个，就选中它再点"
-            "「只处理当前文件」。导出的 WAV 沿用源文件的名字（例外：输出目录就是源目录、"
-            "源又是 wav 时会退让成 _tagged，免得把原始素材覆盖掉）。",
+            "1. 将音频或视频文件（可整个文件夹）拖入窗口。",
+            "2. 在频谱图上拖动印章框，确定水印的频率与时间范围。",
+            "3. 点击「处理所有文件」批量导出，或「只处理当前文件」单独导出。",
         ]))
-        layout.addWidget(self._card("图案与参数", [
-            "图案来源可以是文字或图片。文字支持中文与多行，还能开启「按文件名生成」，"
-            "让每个文件印上自己的文件名。",
-            "衰减是削弱图案区域 —— 但它只能改变素材里本来就有的内容，"
-            "空白频段乘任何系数仍然是空白。",
-            "注入是在图案区域造出内容 —— 即使超高频那种原本一片空白的地方，也能"
-            "画出图案。代价是宽频段叠加高强度容易削波，收窄频段或降低强度即可。",
-            "强度在两种印法下都是 0 = 无效果、1 = 效果拉满，默认值各自独立"
-            "（衰减 0.8、注入 0.6），切换时会取回自己那份。",
-            "把框拖到 15 kHz 以上而当前是衰减、或拖到 10 kHz 以下而当前是注入时，"
-            "程序会提醒一次并可以直接切换 —— 同一首曲目同一类建议只提一次。",
-            "频率位置在所有文件上按比例应用，因此不同采样率的素材会有一点点 Hz 偏移。",
-            "FFT 越大频率越细、时间越粗。印章时长建议明显大于 0.1 秒，太短会被 STFT 的帧边界稀释。",
+        layout.addWidget(self._card("两种印法", [
+            "衰减：降低图案区域的能量，仅对素材已有内容有效。",
+            "注入：在图案区域合成能量，空白频段也能形成图案。",
+            "强度 0 为无效果、1 为最强；两者各自记忆，默认 0.95 / 0.6。",
         ]))
-        layout.addWidget(self._card("循环印刷", [
-            "打开开关后，水印会在同样的频段反复印下去，每次的持续长度等于"
-            "「位置与尺寸」里的时长。「间隔」量的是**上一次印完到下一次开始**的"
-            "距离，所以印章本身多长都不会挤占它。",
-            "频谱上会随之铺出一串淡色的影子印章 —— 它们的位置由第一个框和间隔推出来，"
-            "所以只需要调第一个框，后面的会自动跟着走。",
-            "「上限」留作「无限制」就一直印到音频结束；末尾放不下的那一次会被音频长度截断。",
+        layout.addWidget(self._card("默认开启的三项", [
+            "图案描边：沿图案外沿附加一层反向处理，与本体重构为峰谷对，提高去除成本。",
+            "保持原始水印比例：时长由图案宽高比反推，避免拉伸变形。",
+            "循环印刷：按设定间隔重复印刷；间隔指上次结束到下次开始的距离。",
+        ]))
+        layout.addWidget(self._card("频率位置", [
+            "默认 9–10.5 kHz。拖动印章框时显示两块参考区域：",
+            "绿色为推荐印刷区域（7–13 kHz）；",
+            "黄色为敏感频段（20 Hz–5 kHz），该频段内的改动最易被察觉。",
+            "两者均为参考范围，不构成限制。",
         ]))
         layout.addWidget(self._card("支持的格式", [
-            "音频输入：wav / mp3 / flac / aif / aiff / ogg。",
-            "视频输入：mp4 / mkv / mov / avi / webm 等，需要系统里装有 ffmpeg。",
-            "输出格式在「高级参数」里选。开着「合成视频」时，视频素材会输出成视频 —— "
-            "画面原样保留，只把处理过的音轨换进去；关掉则一律只出音频。",
-            "wav / flac / aiff / ogg / mp3 由 libsndfile 直接编码，m4a 以及所有视频合成需要 ffmpeg。",
+            "音频：wav / mp3 / flac / aif / aiff / ogg",
+            "视频：mp4 / mkv / mov / avi / webm 等，需安装 ffmpeg",
+            "输出格式在「高级参数」中选择；启用「合成视频」时，视频素材将输出为视频。",
         ]))
         layout.addStretch(1)
 
@@ -1324,29 +1470,77 @@ class HelpPage(QWidget):
         return card
 
 
-class MainWindow(FluentWindow):
-    """应用主窗口。"""
+class HelpDialog(QDialog):
+    """使用说明弹窗：一个可滚动的窗口，内容就是 :class:`HelpContent`。"""
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("使用说明")
+        self.setMinimumSize(520, 420)
+        # 默认开到刚好看全 —— 内容在 660 宽下要 727 高，留一点余量免得一上来
+        # 就顶着滚动条。窗口仍可自由缩放。
+        self.resize(700, 800)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.viewport().setStyleSheet("background: transparent;")
+        scroll.setWidget(HelpContent(scroll))
+        layout.addWidget(scroll, 1)
+
+
+class MainWindow(FluentWindowBase):
+    """应用主窗口。
+
+    只有批量处理这一个功能，所以不留侧边导航栏 —— 直接让页面铺满窗口，
+    省下那一条常驻的宽度。使用说明挪进了底部操作区的按钮里。
+    """
 
     def __init__(self) -> None:
         super().__init__()
+        # 顺序要紧：FluentTitleBar 只在初始化时接上 windowTitleChanged 信号，
+        # 并不会回头读一次当前标题 —— 先设标题的话它拿到的是空字符串，标题栏
+        # 就只剩一个图标。（窗口图标同理，好在 main.py 是之后才设的。）
+        self.setTitleBar(FluentTitleBar(self))
+        # 程序名仍要设：任务栏、Alt+Tab 都靠它。只是自绘标题栏里不再显示 ——
+        # 左侧留空，只留右边那排窗口按钮，跟内容区那一片卡片放在一起更清爽。
         self.setWindowTitle("频谱水印生成")
+        self.titleBar.iconLabel.hide()
+        self.titleBar.titleLabel.hide()
         # 尺寸不在这里设 —— 见 apply_default_size()，它必须等窗口显示之后才生效
 
         self.batch_page = BatchPage(self)
-        self.help_page = HelpPage(self)
+        self.stackedWidget.addWidget(self.batch_page)
+        self.stackedWidget.setCurrentWidget(self.batch_page)
 
-        self.addSubInterface(self.batch_page, FluentIcon.MUSIC, "批量处理")
-        self.addSubInterface(self.help_page, FluentIcon.HELP, "使用说明")
+        # 没走 FluentWindow 那条路，得自己把内容接进根布局：
+        # 上边距 48 是给浮在上面的标题栏让位。
+        self.hBoxLayout.setContentsMargins(0, 48, 0, 0)
+        self.hBoxLayout.addWidget(self.stackedWidget)
 
-        self.navigationInterface.setExpandWidth(180)
+        self._help_dialog: Optional[HelpDialog] = None
+        self.batch_page.helpRequested.connect(self._show_help)
+
+    def _show_help(self) -> None:
+        """弹出使用说明；已经开着就带到前面来，不重复开一堆窗口。"""
+        if self._help_dialog is None:
+            self._help_dialog = HelpDialog(self)
+        self._help_dialog.show()
+        self._help_dialog.raise_()
+        self._help_dialog.activateWindow()
 
     def apply_default_size(self) -> None:
         """设成默认窗口尺寸；屏幕装不下时**等比**收窄。
 
-        必须在 ``show()`` **之后**调用。FluentWindow 的初始化里有延迟执行的
-        部分，会在事件循环第一次转动时把窗口尺寸重置成 Qt 的默认值
-        （500x500）—— 在那之前调的 ``resize()`` 全都会被它盖掉，实测延迟一帧
-        也没用，只有显示之后再设才留得住。
+        历史注记：``FluentWindow`` 的初始化里有延迟执行的部分，会在事件循环
+        第一次转动时把窗口尺寸重置成 Qt 默认的 500x500，所以那时**必须**等
+        ``show()`` 之后再设。换成不带导航栏的基类后这个行为没有了（实测
+        ``show()`` 前 resize 也能留住），这个函数仍放在显示之后调用 —— 顺序
+        没有坏处，也免得哪天换回带导航的窗口时又踩一遍。
 
         收窄要等比，宽高各自受限会导致比例失真 —— 高 DPI 缩放或小屏都会撞上。
         """
@@ -1361,8 +1555,9 @@ class MainWindow(FluentWindow):
             )
             if scale < 1.0:
                 width, height = int(width * scale), int(height * scale)
-        # 最小尺寸也跟着收，否则窄屏上会被它顶回去
-        self.setMinimumSize(min(1120, width), min(720, height))
+        # 最小尺寸也跟着收，否则窄屏上会被它顶回去。
+        # 少了侧边栏那一条，下限可以比从前低一档（参数列另有 460 的下限兜着）。
+        self.setMinimumSize(min(1020, width), min(680, height))
         self.resize(width, height)
 
     def closeEvent(self, event) -> None:  # noqa: N802
