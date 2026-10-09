@@ -265,4 +265,7 @@ python -m spectrumtag_batch.tests.make_demo      # 生成处理前后对比图
 
 ## 许可证
 
-算法移植自 [SpectrumTag](https://github.com/sweetorange1/SpectrumTag)，该项目以 **AGPL-3.0** 发布。本程序作为其衍生作品，同样适用 AGPL-3.0：分发（含以网络服务形式提供）时须一并提供源码。
+[GNU Affero General Public License v3.0](LICENSE)（AGPL-3.0）。
+
+算法移植自 [SpectrumTag](https://github.com/sweetorange1/SpectrumTag)，该项目同样以 AGPL-3.0 发布。
+本程序作为其衍生作品适用同一许可证：分发（含以网络服务形式提供）时须一并提供源码。
