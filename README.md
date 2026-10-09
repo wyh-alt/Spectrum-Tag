@@ -176,7 +176,7 @@ python run.py          # 或 python -m spectrumtag_batch
 需要 Python 3.10+。
 
 ```bash
-pip install numpy scipy soundfile pillow PyQt6 PyQt6-Fluent-Widgets pyqtgraph
+pip install -r requirements.txt
 ```
 
 处理视频还需系统里有 `ffmpeg`（可用环境变量 `SPECTRUMTAG_FFMPEG` 指定路径，或放到 `spectrumtag_batch/vendor/ffmpeg/`）。

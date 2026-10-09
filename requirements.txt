@@ -1,0 +1,18 @@
+# 频谱水印生成 —— 运行依赖
+#
+# 需要 Python 3.10+。下面的版本下限是实际验证过的组合，装更新的版本通常也没
+# 问题；PyQt6-Fluent-Widgets 那条尤其别往回退 —— 无导航栏的窗口基类
+# （qfluentwidgets.window.fluent_window.FluentWindowBase）只在较新的版本里有。
+
+numpy>=2.1                    # 全部 DSP 与数组运算，STFT/OLA 的矩阵化实现
+soundfile>=0.13               # 音频读写（libsndfile 绑定；MP3 编解码要 0.12+）
+pillow>=11.2                  # 图片水印的读取与二值化
+PyQt6>=6.11                   # 界面
+PyQt6-Fluent-Widgets>=1.11    # Fluent 风格控件
+pyqtgraph>=0.14               # 频谱图、印章框与图案叠层
+
+# 视频处理另需系统装有 ffmpeg：可用环境变量 SPECTRUMTAG_FFMPEG 指定路径，
+# 或把可执行文件放到 spectrumtag_batch/vendor/ffmpeg/ 下。
+#
+# 打包成单文件 exe 还需要 PyInstaller（pip install pyinstaller），
+# 随后 python -m PyInstaller build_exe.spec --noconfirm。
