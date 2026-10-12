@@ -64,6 +64,7 @@ def _verify(candidate: str) -> bool:
             capture_output=True,
             timeout=10,
             check=False,
+            **no_console_kwargs(),
         )
     except (OSError, subprocess.SubprocessError):
         return False
@@ -144,6 +145,20 @@ _NTSTATUS_HINTS: dict[int, str] = {
 }
 
 
+def no_console_kwargs() -> dict:
+    """拉起外部程序时该带的参数 —— 别让它弹出控制台窗口。
+
+    打包成 GUI 程序（自身没有控制台）之后，Windows 会为每个**控制台**子进程
+    新建一个黑框。检测 ffmpeg、抽音轨、合成视频一路下来能闪好几次，看着像
+    出了故障。``CREATE_NO_WINDOW`` 把它按住；其它平台没有这回事，返回空即可。
+
+    调用 ffmpeg 的每一处都得带上它 —— 自检里有一条盯着别漏。
+    """
+    if os.name == "nt":
+        return {"creationflags": subprocess.CREATE_NO_WINDOW}
+    return {}
+
+
 def describe_returncode(code: int) -> str:
     """把子进程退出码转成人能看懂的说明。"""
     unsigned = code & 0xFFFFFFFF
@@ -168,7 +183,8 @@ def _run_extract(ffmpeg: str, video_path: str, out_path: str) -> None:
     ]
     try:
         result = subprocess.run(
-            cmd, capture_output=True, timeout=_EXTRACT_TIMEOUT, check=False
+            cmd, capture_output=True, timeout=_EXTRACT_TIMEOUT, check=False,
+            **no_console_kwargs(),
         )
     except subprocess.TimeoutExpired as exc:
         raise MediaError(
@@ -230,7 +246,8 @@ def mux_video(
     ]
     try:
         result = subprocess.run(
-            cmd, capture_output=True, timeout=_EXTRACT_TIMEOUT, check=False
+            cmd, capture_output=True, timeout=_EXTRACT_TIMEOUT, check=False,
+            **no_console_kwargs(),
         )
     except subprocess.TimeoutExpired as exc:
         raise MediaError(

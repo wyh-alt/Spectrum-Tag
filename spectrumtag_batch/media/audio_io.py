@@ -214,7 +214,7 @@ def _write_with_ffmpeg(
     import tempfile
 
     # 延迟导入，避开两个模块互相引用
-    from .video_io import describe_returncode, find_ffmpeg
+    from .video_io import describe_returncode, find_ffmpeg, no_console_kwargs
 
     ffmpeg = find_ffmpeg()
     if not ffmpeg:
@@ -234,6 +234,7 @@ def _write_with_ffmpeg(
                 capture_output=True,
                 timeout=600,
                 check=False,
+                **no_console_kwargs(),
             )
         except (OSError, subprocess.SubprocessError) as exc:
             raise MediaError(f"调用 ffmpeg 失败：{exc}") from exc

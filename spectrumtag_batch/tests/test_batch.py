@@ -301,6 +301,35 @@ def check_m4a_input(tmp: str) -> bool:
     return ok
 
 
+def check_subprocess_no_console() -> bool:
+    """拉起外部程序时不能弹出控制台窗口。
+
+    打包成 GUI 程序（自身没有控制台）后，Windows 会为每个控制台子进程新建
+    一个黑框 —— 检测 ffmpeg、抽音轨、合成视频一路下来能闪好几次，看着像出
+    了故障。每个调用点都得带 CREATE_NO_WINDOW，漏一个就闪一次，所以这里
+    数一遍源码里的调用与标志是否对得上。
+    """
+    import inspect
+
+    from ..media import audio_io, video_io
+
+    calls = guarded = 0
+    for mod in (video_io, audio_io):
+        src = inspect.getsource(mod)
+        calls += src.count("subprocess.run(")
+        guarded += src.count("**no_console_kwargs()")
+
+    flag = video_io.no_console_kwargs()
+    expected = (
+        {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
+    )
+
+    ok = calls > 0 and calls == guarded and flag == expected
+    print(f"[14] 子进程不弹控制台        {guarded}/{calls} 处带标志  "
+          f"{flag}  ->  {'通过' if ok else '失败'}")
+    return ok
+
+
 def check_mux_keeps_video_intact(tmp: str) -> bool:
     """合成视频时画面必须原样保留：分辨率、帧率、帧数一个都不能少。
 
@@ -627,6 +656,7 @@ def main() -> int:
             check_returncode_description(),
             check_m4a_input(tmp),
             check_mux_keeps_video_intact(tmp),
+            check_subprocess_no_console(),
             check_filename_text_mode(tmp),
             check_output_naming(tmp),
             check_output_formats(tmp),
