@@ -68,7 +68,8 @@ from ..core.params import (
     VideoFormat,
 )
 from ..core.pattern import PatternError, build_outline, build_pattern
-from ..media.audio_io import MediaError, read_audio
+from ..media.audio_io import MediaError
+from ..media.decode import decode_media, needs_ffmpeg
 from ..media.video_io import find_ffmpeg, is_video_file
 from .spectrogram import SpectrogramView
 from .widgets import (
@@ -168,13 +169,8 @@ class PreviewWorker(QThread):
 
     def run(self) -> None:  # noqa: D102
         try:
-            if is_video_file(self._path):
-                from ..media.video_io import extract_audio_track
-
-                with extract_audio_track(self._path) as wav_path:
-                    audio = read_audio(wav_path)
-            else:
-                audio = read_audio(self._path)
+            # 与批处理共用同一个解码入口：视频和 m4a 那类容器都由它转一道
+            audio = decode_media(self._path)
         except (MediaError, Exception) as exc:  # noqa: BLE001
             self.failed.emit(self._path, str(exc))
             return
@@ -1304,10 +1300,10 @@ class BatchPage(QWidget):
             )
             return
 
-        if any(is_video_file(p) for p in files) and not find_ffmpeg():
+        if any(needs_ffmpeg(p) for p in files) and not find_ffmpeg():
             InfoBar.warning(
                 "缺少 ffmpeg",
-                "待处理列表里有视频文件，但没找到 ffmpeg，视频会被跳过",
+                "列表里有视频或 m4a / wma 这类文件，但没找到 ffmpeg，这些会被跳过",
                 parent=self.window(),
                 position=InfoBarPosition.TOP,
                 duration=5000,

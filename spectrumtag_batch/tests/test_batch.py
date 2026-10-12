@@ -255,6 +255,130 @@ def check_text_pattern_locality(tmp: str) -> bool:
     return ok
 
 
+def check_m4a_input(tmp: str) -> bool:
+    """m4a 输入：libsndfile 解不开，得借 ffmpeg 转一道。
+
+    这条守的是"输入与输出对等" —— m4a 一直躺在导出格式列表里，之前却拖不进
+    待处理清单（不在扩展名白名单里，进去了也解不开）。
+    """
+    ffmpeg = find_ffmpeg()
+    if not ffmpeg:
+        print("[12] m4a 输入               未找到 ffmpeg  ->  跳过")
+        return True
+
+    from ..core.params import AudioFormat, OutputSpec
+    from ..media.decode import needs_ffmpeg
+
+    src = os.path.join(tmp, "m4a_src")
+    out = os.path.join(tmp, "out_m4a")
+    os.makedirs(src, exist_ok=True)
+    path = os.path.join(src, "clip.m4a")
+    proc = subprocess.run(
+        [ffmpeg, "-v", "error", "-y", "-f", "lavfi",
+         "-i", "sine=frequency=440:duration=2", "-c:a", "aac", path],
+        capture_output=True, check=False,
+    )
+    if proc.returncode != 0 or not os.path.isfile(path):
+        print("[12] m4a 输入               样本生成失败  ->  跳过")
+        return True
+
+    accepted = collect_files([path]) == [path]
+    routed = needs_ffmpeg(path)
+    # 输出固定为 wav：这条例验的是输入侧，别让 m4a 编码再掺一脚
+    result = run_batch(
+        [path], _make_job("M4A"), out, OutputSpec(audio_format=AudioFormat.WAV)
+    )
+    if result.succeeded != 1:
+        print(f"[12] m4a 输入               受理={accepted} 走ffmpeg={routed}  "
+              f"处理失败：{result.items[0].message}  ->  失败")
+        return False
+
+    tagged = read_audio(result.items[0].output_path)
+    ok = accepted and routed and tagged.duration_sec > 1.5
+    print(f"[12] m4a 输入               受理={accepted} 走ffmpeg={routed}  "
+          f"解得 {tagged.duration_sec:.2f}s @ {tagged.sample_rate} Hz"
+          f"  ->  {'通过' if ok else '失败'}")
+    return ok
+
+
+def check_mux_keeps_video_intact(tmp: str) -> bool:
+    """合成视频时画面必须原样保留：分辨率、帧率、帧数一个都不能少。
+
+    这条来自一个真实缺陷：mux 的命令里带了 ``-shortest``，输出便以最短的流
+    为准 —— 源视频的音轨只要比画面短，画面就跟着被截掉（实测 4 秒 100 帧
+    出来只剩 2 秒 50 帧）。画面是主体，不该被音频牵着走。
+    """
+    ffmpeg = find_ffmpeg()
+    ffprobe = os.path.join(os.path.dirname(ffmpeg), "ffprobe.exe") if ffmpeg else ""
+    if not ffmpeg or not os.path.isfile(ffprobe):
+        print("[13] 合成保画面              缺 ffmpeg / ffprobe  ->  跳过")
+        return True
+
+    from ..core.params import OutputSpec, VideoFormat
+
+    src = os.path.join(tmp, "mux_src")
+    out = os.path.join(tmp, "out_mux")
+    os.makedirs(src, exist_ok=True)
+    path = os.path.join(src, "short_audio.mp4")
+    # 画面 4 秒、音轨只给 2 秒 —— 正是会被 -shortest 截断的那种源
+    proc = subprocess.run([
+        ffmpeg, "-v", "error", "-y",
+        "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=25:duration=4",
+        "-f", "lavfi", "-i", "sine=frequency=440:duration=2",
+        "-map", "0:v", "-map", "1:a",
+        "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", path,
+    ], capture_output=True, check=False)
+    if proc.returncode != 0 or not os.path.isfile(path):
+        print("[13] 合成保画面              样本生成失败  ->  跳过")
+        return True
+
+    def video_signature(p: str) -> str:
+        r = subprocess.run(
+            [ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries",
+             "stream=width,height,r_frame_rate,nb_frames", "-of", "csv=p=0", p],
+            capture_output=True, check=False, text=True,
+        )
+        return r.stdout.strip()
+
+    result = run_batch(
+        [path], _make_job("MUX"), out,
+        output=OutputSpec(mux_video=True, video_format=VideoFormat.MP4),
+    )
+    if result.succeeded != 1:
+        print(f"[13] 合成保画面              处理失败：{result.items[0].message}"
+              f"  ->  失败")
+        return False
+
+    before, after = video_signature(path), video_signature(result.items[0].output_path)
+    ok = before == after and before != ""
+    print(f"[13] 合成保画面              画面签名 {before} → {after}"
+          f"  ->  {'通过' if ok else '失败'}")
+    return ok
+
+
+def check_returncode_description() -> bool:
+    """子进程没起来时的退出码要翻译成人话，而不是甩一个 3221225794 出去。
+
+    这类码（NTSTATUS）出现时 ffmpeg 的 stderr 是空的，光看数字完全无从下手。
+    """
+    from ..media.video_io import describe_returncode
+
+    init_failed = describe_returncode(0xC0000142)
+    signed = describe_returncode(0xC0000142 - 0x100000000)   # 有符号形式也要认
+    plain = describe_returncode(255)
+
+    ok = (
+        "DLL 初始化失败" in init_failed
+        and "0xC0000142" in init_failed
+        and init_failed == signed
+        and plain == "退出码 255"
+    )
+    print(f"[11] 退出码翻译              0xC0000142 → {init_failed[:24]}…  "
+          f"255 → {plain}  ->  {'通过' if ok else '失败'}")
+    return ok
+
+
 def check_video_input(tmp: str) -> bool:
     """视频输入：抽音轨 → 水印 → 输出 WAV。"""
     ffmpeg = find_ffmpeg()
@@ -500,6 +624,9 @@ def main() -> int:
             check_watermark_actually_embedded(tmp),
             check_text_pattern_locality(tmp),
             check_video_input(tmp),
+            check_returncode_description(),
+            check_m4a_input(tmp),
+            check_mux_keeps_video_intact(tmp),
             check_filename_text_mode(tmp),
             check_output_naming(tmp),
             check_output_formats(tmp),

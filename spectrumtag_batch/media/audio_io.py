@@ -17,8 +17,15 @@ from typing import Optional
 import numpy as np
 import soundfile as sf
 
-# 可解码的音频扩展名（与 SpectrumTag 的白名单一致）
-AUDIO_EXTENSIONS = (".wav", ".mp3", ".flac", ".aif", ".aiff", ".ogg")
+# libsndfile 直接解得开的音频容器（与 SpectrumTag 的白名单一致）
+_LIBSNDFILE_EXTENSIONS = (".wav", ".mp3", ".flac", ".aif", ".aiff", ".ogg")
+
+# libsndfile 解不开、得借 ffmpeg 转一道的音频容器。m4a 是最常撞上的一个 ——
+# 输出格式里一直有它，输入却收不了，两头不对等。
+FFMPEG_AUDIO_EXTENSIONS = (".m4a", ".aac", ".wma")
+
+# 对外统称的"可解码音频"
+AUDIO_EXTENSIONS = _LIBSNDFILE_EXTENSIONS + FFMPEG_AUDIO_EXTENSIONS
 
 # 位深"穿透"保存的 PCM 子类型；其余（有损格式）统一落到 _FALLBACK_SUBTYPE
 _PASSTHROUGH_SUBTYPES = ("PCM_16", "PCM_24", "PCM_32", "FLOAT", "DOUBLE")
@@ -206,7 +213,8 @@ def _write_with_ffmpeg(
     import subprocess
     import tempfile
 
-    from .video_io import find_ffmpeg      # 延迟导入，避开两个模块互相引用
+    # 延迟导入，避开两个模块互相引用
+    from .video_io import describe_returncode, find_ffmpeg
 
     ffmpeg = find_ffmpeg()
     if not ffmpeg:
@@ -232,7 +240,7 @@ def _write_with_ffmpeg(
 
     if result.returncode != 0:
         detail = result.stderr.decode("utf-8", errors="replace").strip()
-        detail = detail.splitlines()[-1] if detail else f"退出码 {result.returncode}"
+        detail = detail.splitlines()[-1] if detail else describe_returncode(result.returncode)
         raise MediaError(f"写入失败 {os.path.basename(path)}：{detail}")
 
 

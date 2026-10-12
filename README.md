@@ -93,7 +93,7 @@ python run.py          # 或 python -m spectrumtag_batch
 其他：
 
 - **按文件名生成文字** —— 每个文件印上自己的文件名，便于追溯来源
-- **视频输入** —— 自动抽取音轨处理后输出 WAV（需要系统装有 ffmpeg）
+- **视频与 m4a 输入** —— 自动抽取音轨后再处理（需要系统装有 ffmpeg）
 - **原样导出** —— 保持源文件的采样率、位深（16/24/32-bit）与声道数
 - **单个失败不中断** —— 坏文件记入失败明细，整批继续跑
 
@@ -111,6 +111,7 @@ python run.py          # 或 python -m spectrumtag_batch
 | 类型 | 格式 | 说明 |
 | --- | --- | --- |
 | 音频输入 | `wav` `mp3` `flac` `aif` `aiff` `ogg` | 由 libsndfile 解码 |
+| 音频输入 | `m4a` `aac` `wma` | libsndfile 解不开，先经 ffmpeg 转码 |
 | 视频输入 | `mp4` `mkv` `mov` `avi` `webm` 等 15 种 | 仅取音轨，画面不保留；需要 ffmpeg |
 | 图片水印 | `png` `jpg` `jpeg` `bmp` `gif` | |
 | 音频输出 | 可选 `与源一致` / `wav` / `mp3` / `m4a` / `flac` / `aif` / `aiff` / `ogg` | 文件名沿用源文件主名；采样率、位深、声道数按源保留 |
@@ -179,7 +180,8 @@ python run.py          # 或 python -m spectrumtag_batch
 pip install -r requirements.txt
 ```
 
-处理视频还需系统里有 `ffmpeg`（可用环境变量 `SPECTRUMTAG_FFMPEG` 指定路径，或放到 `spectrumtag_batch/vendor/ffmpeg/`）。
+处理视频、以及解码 m4a / aac / wma 还需系统里有 `ffmpeg`（可用环境变量
+`SPECTRUMTAG_FFMPEG` 指定路径，或放到 `spectrumtag_batch/vendor/ffmpeg/`）。
 
 ## 项目结构
 

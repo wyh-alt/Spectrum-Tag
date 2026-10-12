@@ -28,13 +28,12 @@ from .media.audio_io import (
     AUDIO_EXTENSIONS,
     MediaError,
     output_subtype_for,
-    read_audio,
     unique_output_path,
     write_audio,
 )
+from .media.decode import decode_media
 from .media.video_io import (
     VIDEO_EXTENSIONS,
-    extract_audio_track,
     is_video_file,
     mux_video,
 )
@@ -176,17 +175,6 @@ def _job_for_file(base_job: RenderJob, path: str, text_mode: TextMode) -> Render
     return base_job.with_pattern(text=stem or base_job.pattern.text)
 
 
-def _decode_source(path: str):
-    """读取一个源文件；视频先抽音轨到临时 WAV 再解码。
-
-    音轨数据在 ``with`` 块内整段读进内存，临时文件随上下文退出即被清理。
-    """
-    if is_video_file(path):
-        with extract_audio_track(path) as wav_path:
-            return read_audio(wav_path)
-    return read_audio(path)
-
-
 def _write_video_result(
     source_path: str,
     samples: np.ndarray,
@@ -299,7 +287,7 @@ def run_batch(
                 item.message = "已取消"
                 break
 
-            audio = _decode_source(path)
+            audio = decode_media(path)
             item.duration_sec = audio.duration_sec
 
             # 图案：固定模式复用，逐文件名模式现算

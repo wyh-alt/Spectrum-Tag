@@ -131,6 +131,30 @@ def is_video_file(path: str) -> bool:
     return os.path.splitext(path)[1].lower() in VIDEO_EXTENSIONS
 
 
+# 子进程"根本没起来"时，Windows 给的退出码是 NTSTATUS 值（高位为 1）。
+# 这时 stderr 是空的，光甩一个 3221225794 给用户毫无意义 —— 每个码都指向
+# 不同的处置方向，得翻译出来。
+_NTSTATUS_HINTS: dict[int, str] = {
+    0xC0000005: "访问冲突，ffmpeg 自身崩溃",
+    0xC000001D: "非法指令，这个 ffmpeg 构建与当前 CPU 不匹配",
+    0xC0000022: "拒绝访问，多半是杀毒软件拦下了 ffmpeg",
+    0xC000007B: "映像格式错误，32/64 位不匹配或缺少运行库",
+    0xC0000135: "缺少依赖的 DLL",
+    0xC0000142: "DLL 初始化失败，ffmpeg 没能启动（多为杀毒软件拦截，或系统资源不足）",
+}
+
+
+def describe_returncode(code: int) -> str:
+    """把子进程退出码转成人能看懂的说明。"""
+    unsigned = code & 0xFFFFFFFF
+    hint = _NTSTATUS_HINTS.get(unsigned)
+    if hint is not None:
+        return f"{hint}（退出码 0x{unsigned:08X}）"
+    if code < 0:
+        return f"被信号终止（{-code}）"
+    return f"退出码 {code}"
+
+
 def _run_extract(ffmpeg: str, video_path: str, out_path: str) -> None:
     cmd = [
         ffmpeg,
@@ -155,7 +179,7 @@ def _run_extract(ffmpeg: str, video_path: str, out_path: str) -> None:
 
     if result.returncode != 0:
         detail = result.stderr.decode("utf-8", errors="replace").strip()
-        detail = detail.splitlines()[-1] if detail else f"退出码 {result.returncode}"
+        detail = detail.splitlines()[-1] if detail else describe_returncode(result.returncode)
         raise MediaError(f"提取音轨失败 {os.path.basename(video_path)}：{detail}")
     if not os.path.isfile(out_path) or os.path.getsize(out_path) == 0:
         raise MediaError(f"视频没有可用音轨：{os.path.basename(video_path)}")
@@ -190,6 +214,10 @@ def mux_video(
 
     os.makedirs(os.path.dirname(os.path.abspath(output_path)) or ".", exist_ok=True)
     codec = _MUX_AUDIO_CODEC.get(container.lower(), "aac")
+    # 特意**不加** -shortest：它让输出以最短的那条流为准。源视频的音轨若比
+    # 画面短（录屏、剪辑半成品里不少见），整个输出会跟着音频截断，画面白白
+    # 丢掉一截 —— 实测 4 秒 100 帧的源会变成 2 秒 50 帧。这里画面是主体，得
+    # 保完整；音频短出来的那一段自然是静音。
     cmd = [
         ffmpeg, "-v", "error", "-y",
         "-i", source_video,
@@ -198,7 +226,6 @@ def mux_video(
         "-map", "1:a:0",        # 处理过的音轨
         "-c:v", "copy",
         "-c:a", codec,
-        "-shortest",
         output_path,
     ]
     try:
@@ -214,7 +241,7 @@ def mux_video(
 
     if result.returncode != 0:
         detail = result.stderr.decode("utf-8", errors="replace").strip()
-        detail = detail.splitlines()[-1] if detail else f"退出码 {result.returncode}"
+        detail = detail.splitlines()[-1] if detail else describe_returncode(result.returncode)
         raise MediaError(
             f"合成视频失败 {os.path.basename(output_path)}：{detail}"
         )
@@ -237,7 +264,8 @@ def extract_audio_track(video_path: str) -> Iterator[str]:
     ffmpeg = find_ffmpeg()
     if not ffmpeg:
         raise MediaError(
-            "需要 ffmpeg 才能处理视频。请安装 ffmpeg 并加入 PATH，"
+            "需要 ffmpeg 才能处理视频，以及 m4a / AAC / WMA 这类音频容器。"
+            "请安装 ffmpeg 并加入 PATH，"
             f"或设置环境变量 {_ENV_VAR} 指向 ffmpeg 可执行文件。"
         )
 
