@@ -45,8 +45,9 @@ from ..batch import (
     SUPPORTED_EXTENSIONS,
     BatchProgress,
     BatchResult,
+    SourceFile,
     TextMode,
-    collect_files,
+    collect_sources,
     run_batch,
 )
 from ..core.params import (
@@ -186,7 +187,7 @@ class BatchWorker(QThread):
 
     def __init__(
         self,
-        files: list[str],
+        files: list[SourceFile],
         job: RenderJob,
         output_dir: str,
         output: OutputSpec,
@@ -240,7 +241,7 @@ class BatchPage(QWidget):
         super().__init__(parent)
         self.setObjectName("batchPage")
 
-        self._files: list[str] = []
+        self._files: list[SourceFile] = []
         self._preview_path: Optional[str] = None
         self._preview_worker: Optional[PreviewWorker] = None
         self._preview_samples: Optional[np.ndarray] = None
@@ -1074,11 +1075,11 @@ class BatchPage(QWidget):
             self._add_paths([folder])
 
     def _add_paths(self, paths: list[str]) -> None:
-        found = collect_files(paths)
-        existing = {os.path.normcase(os.path.abspath(p)) for p in self._files}
+        found = collect_sources(paths)
+        existing = {os.path.normcase(os.path.abspath(s.path)) for s in self._files}
         added = [
-            p for p in found
-            if os.path.normcase(os.path.abspath(p)) not in existing
+            s for s in found
+            if os.path.normcase(os.path.abspath(s.path)) not in existing
         ]
         if not added:
             InfoBar.warning(
@@ -1092,10 +1093,10 @@ class BatchPage(QWidget):
 
         was_empty = not self._files
         self._files.extend(added)
-        for path in added:
-            item = QListWidgetItem(self._display_name(path))
-            item.setData(Qt.ItemDataRole.UserRole, path)
-            item.setToolTip(path)
+        for source in added:
+            item = QListWidgetItem(self._display_name(source))
+            item.setData(Qt.ItemDataRole.UserRole, source.path)
+            item.setToolTip(source.path)
             self.file_list.addItem(item)
 
         self.file_count_label.setText(f"（共 {len(self._files)} 个）")
@@ -1126,9 +1127,14 @@ class BatchPage(QWidget):
             return "图片请在「水印图案」里选，或切到图片模式后拖进那个路径框"
         return "这里只收音频和视频文件"
 
-    def _display_name(self, path: str) -> str:
-        prefix = "[视频] " if is_video_file(path) else ""
-        return f"{prefix}{os.path.basename(path)}"
+    def _display_name(self, source: SourceFile) -> str:
+        """列表里显示的名字。
+
+        来自文件夹的文件带上相对路径 —— 同名文件分属不同文件夹时，光看主名
+        分不清谁是谁，而导出时它们正是要各自落回那个位置。
+        """
+        prefix = "[视频] " if is_video_file(source.path) else ""
+        return f"{prefix}{source.display_name}"
 
     def _remove_selected(self) -> None:
         rows = sorted(
@@ -1162,7 +1168,7 @@ class BatchPage(QWidget):
             self.spectrum_hint.setVisible(True)
             return
 
-        path = self._files[row]
+        path = self._files[row].path
         self.spectrum_hint.setText(f"正在读取 {_shorten(os.path.basename(path), 50)} …")
         self.spectrum_hint.setVisible(True)
 
@@ -1284,8 +1290,12 @@ class BatchPage(QWidget):
             return
         self._start_batch(list(self._files))
 
-    def _start_batch(self, files: list[str]) -> None:
-        """校验设置并在后台启动渲染。"""
+    def _start_batch(self, files: list[SourceFile]) -> None:
+        """校验设置并在后台启动渲染。
+
+        ``files`` 里带着每个文件的输出落点 —— 哪怕是"只处理当前文件"，
+        它也照旧落回它原本该在的子目录，输出结构不因处理范围而变。
+        """
         if self._batch_worker is not None and self._batch_worker.isRunning():
             return                       # 已经在跑，忽略重复触发
 
@@ -1300,7 +1310,7 @@ class BatchPage(QWidget):
             )
             return
 
-        if any(needs_ffmpeg(p) for p in files) and not find_ffmpeg():
+        if any(needs_ffmpeg(s.path) for s in files) and not find_ffmpeg():
             InfoBar.warning(
                 "缺少 ffmpeg",
                 "列表里有视频或 m4a / wma 这类文件，但没找到 ffmpeg，这些会被跳过",
@@ -1450,6 +1460,12 @@ class HelpContent(QWidget):
             "音频：wav / mp3 / flac / aif / aiff / ogg",
             "视频：mp4 / mkv / mov / avi / webm 等，需安装 ffmpeg",
             "输出格式在「高级参数」中选择；启用「合成视频」时，视频素材将输出为视频。",
+        ]))
+        layout.addWidget(self._card("输出目录的结构", [
+            "拖入文件夹：在输出目录里建同名文件夹，内部层级原样重建。",
+            "单独拖入的文件：平铺在输出目录根部，不为它们建文件夹。",
+            "两者混着拖：文件夹按上面的规矩走，单文件仍旧平铺在根部。",
+            "输出的文件名沿用源文件主名，重名时自动追加 _1 / _2。",
         ]))
         layout.addStretch(1)
 

@@ -7,6 +7,9 @@
 * **单文件失败不中断整批**：每个文件包在自己的 try 里，异常记进结果继续跑。
 * **进度是两级**：文件内进度（渲染）与整体进度（含文件计数），供 UI 显示。
 * **取消是协作式的**：回调返回 False 即停止，已写完的文件保留，当前文件回滚。
+* **输出保留输入的层级**：文件夹拖进来就在输出目录里建同名文件夹，里面的
+  子目录照搬；单独拖入的文件平铺在输出目录根部。这层信息由
+  :class:`SourceFile` 一路带到写入处。
 """
 
 from __future__ import annotations
@@ -55,6 +58,30 @@ class TextMode(Enum):
 
     FIXED = "fixed"                  # 整批共用一段固定文字
     FROM_FILENAME = "from_filename"  # 用每个文件的文件名（不含扩展名）
+
+
+@dataclass(frozen=True)
+class SourceFile:
+    """一个待处理文件，连同它在输出目录里的落点。
+
+    ``relative_dir`` 是相对输出目录的子目录：拖入文件夹时它是该文件在文件夹
+    内的位置（首段就是被拖入文件夹的名字），单独拖入的文件为空串、直接落在
+    输出目录根部。
+    """
+
+    path: str
+    relative_dir: str = ""
+
+    @property
+    def name(self) -> str:
+        return os.path.basename(self.path)
+
+    @property
+    def display_name(self) -> str:
+        """带层级的显示名 —— 不同文件夹里的同名文件光看主名分不出来。"""
+        if not self.relative_dir:
+            return self.name
+        return os.path.join(self.relative_dir, self.name)
 
 
 @dataclass
@@ -124,45 +151,72 @@ ProgressFn = Callable[[BatchProgress], bool]
 """进度回调，返回 False 表示请求取消。"""
 
 
-def collect_files(paths: Iterable[str], recursive: bool = True) -> list[str]:
-    """把混合的「文件 / 文件夹」输入展开成去重后的受支持文件列表。
+def _subdir(*parts: str) -> str:
+    """拼出相对输出目录的子目录；空的层级直接跳过。
 
-    顺序保持稳定：先出现的先处理，文件夹内的文件按名称排序。
+    ``os.path.join("album", "")`` 会留下一个多余的尾分隔符，而驱动器根这类
+    没有名字的输入根本不产生首段 —— 两种都在这儿抹平。
     """
-    found: list[str] = []
+    kept = [part for part in parts if part]
+    return os.path.join(*kept) if kept else ""
+
+
+def collect_sources(paths: Iterable[str], recursive: bool = True) -> list[SourceFile]:
+    """把混合的「文件 / 文件夹」输入展开成待处理清单，并记下各自的落点。
+
+    落点规则：
+
+    * **文件夹** —— 以该文件夹的名字为顶层在输出目录里重建一套同样的层级，
+      子目录照搬；
+    * **单个文件** —— 平铺在输出目录根部，不为它单独建文件夹。
+
+    两者混着拖时各按各的规矩走。顺序保持稳定：先出现的先处理，文件夹内的
+    文件按名称排序。同一个文件被重复传入（或既在文件夹里又被单独拖入）只算
+    一次，以先出现的那个身份为准。
+    """
+    found: list[SourceFile] = []
     seen: set[str] = set()
 
-    def _add(path: str) -> None:
+    def _add(path: str, relative_dir: str) -> None:
         key = os.path.normcase(os.path.abspath(path))
         if key in seen:
             return
         seen.add(key)
-        found.append(path)
+        found.append(SourceFile(path=path, relative_dir=relative_dir))
 
     for raw in paths:
         if not raw:
             continue
         if os.path.isdir(raw):
+            # 只有被拖入的那个文件夹本身作为顶层 —— 它的上级路径不进输出
+            root_name = os.path.basename(os.path.normpath(raw))
             if recursive:
-                for root, dirs, files in os.walk(raw):
+                for dirpath, dirs, files in os.walk(raw):
                     dirs.sort()
+                    inner = os.path.relpath(dirpath, raw)
+                    inner = "" if inner == os.curdir else inner
                     for name in sorted(files):
                         if os.path.splitext(name)[1].lower() in SUPPORTED_EXTENSIONS:
-                            _add(os.path.join(root, name))
+                            _add(os.path.join(dirpath, name), _subdir(root_name, inner))
             else:
                 for name in sorted(os.listdir(raw)):
                     full = os.path.join(raw, name)
                     if os.path.isfile(full) and (
                         os.path.splitext(name)[1].lower() in SUPPORTED_EXTENSIONS
                     ):
-                        _add(full)
+                        _add(full, root_name)
         elif os.path.isfile(raw):
             # 单个文件同样要过扩展名 —— 拖进来一张图片或一份文档时，
             # 那是想拿去做水印图案或压根不相干，不该混进待处理清单
             if os.path.splitext(raw)[1].lower() in SUPPORTED_EXTENSIONS:
-                _add(raw)
+                _add(raw, "")
 
     return found
+
+
+def collect_files(paths: Iterable[str], recursive: bool = True) -> list[str]:
+    """同 :func:`collect_sources`，但只取路径 —— 不关心输出层级的场合用它。"""
+    return [item.path for item in collect_sources(paths, recursive)]
 
 
 def _job_for_file(base_job: RenderJob, path: str, text_mode: TextMode) -> RenderJob:
@@ -175,17 +229,29 @@ def _job_for_file(base_job: RenderJob, path: str, text_mode: TextMode) -> Render
     return base_job.with_pattern(text=stem or base_job.pattern.text)
 
 
+def _target_dir(output_dir: str, source: SourceFile) -> str:
+    """该文件最终写进哪个目录 —— 拖入文件夹来的文件落回对应的子目录。"""
+    if not source.relative_dir:
+        return output_dir
+    return os.path.join(output_dir, source.relative_dir)
+
+
+def _as_source(item: "SourceFile | str") -> SourceFile:
+    """容忍直接给路径字符串的调用方 —— 那等同于"单独拖入的文件"。"""
+    return item if isinstance(item, SourceFile) else SourceFile(path=str(item))
+
+
 def _write_video_result(
     source_path: str,
     samples: np.ndarray,
     sample_rate: int,
-    output_dir: str,
+    target_dir: str,
     output: OutputSpec,
 ) -> str:
     """把处理后的音轨合回原视频，画面原样保留。"""
     container = output.video_format.resolve(source_path)
     out_path = unique_output_path(
-        output_dir, Path(source_path).stem, f".{container}", source_path
+        target_dir, Path(source_path).stem, f".{container}", source_path
     )
     # 先落一个无损的中间 WAV，再让 ffmpeg 封进容器
     with tempfile.TemporaryDirectory(prefix="stbatch_mux_") as tmp:
@@ -200,20 +266,20 @@ def _write_audio_result(
     samples: np.ndarray,
     sample_rate: int,
     source_subtype: str,
-    output_dir: str,
+    target_dir: str,
     output: OutputSpec,
 ) -> str:
     """只导出音频，格式按设置或源文件定。"""
     fmt = output.audio_format.resolve(source_path)
     out_path = unique_output_path(
-        output_dir, Path(source_path).stem, f".{fmt}", source_path
+        target_dir, Path(source_path).stem, f".{fmt}", source_path
     )
     write_audio(out_path, samples, sample_rate, fmt, output_subtype_for(source_subtype))
     return out_path
 
 
 def run_batch(
-    files: Sequence[str],
+    files: Sequence["SourceFile | str"],
     job: RenderJob,
     output_dir: str,
     output: OutputSpec = OutputSpec(),
@@ -226,11 +292,12 @@ def run_batch(
     Parameters
     ----------
     files
-        源文件路径列表（应已由 :func:`collect_files` 展开）。
+        源文件列表（应已由 :func:`collect_sources` 展开）。用 :class:`SourceFile`
+        可以带上各自的输出子目录；直接给路径字符串则一律写在输出目录根部。
     job
         水印设置。``text_mode`` 为 FROM_FILENAME 时文字会被逐文件替换。
     output_dir
-        输出目录，不存在时创建。
+        输出目录，不存在时创建。带层级的文件会在它下面重建同名目录。
     output
         输出形态：只出音频，还是把音轨合回视频；以及各自的容器格式。
     progress
@@ -246,7 +313,7 @@ def run_batch(
     output_dir = os.path.abspath(output_dir)
     os.makedirs(output_dir, exist_ok=True)
 
-    steps = list(files)
+    steps = [_as_source(item) for item in files]
     file_count = len(steps)
     result = BatchResult()
 
@@ -275,7 +342,8 @@ def run_batch(
             )
         )
 
-    for index, path in enumerate(steps, start=1):
+    for index, source in enumerate(steps, start=1):
+        path = source.path
         item = BatchItem(source_path=path, status=ItemStatus.RUNNING)
         result.items.append(item)
         started = time.monotonic()
@@ -316,15 +384,20 @@ def run_batch(
                 item.message = "已取消"
                 break
 
+            # 到这一步才建目录：前面的失败或取消不会留下一串空文件夹
+            target_dir = _target_dir(output_dir, source)
+            if target_dir != output_dir:
+                os.makedirs(target_dir, exist_ok=True)
+
             if is_video_file(path) and output.mux_video:
                 out_path = _write_video_result(
-                    path, processed, audio.sample_rate, output_dir, output
+                    path, processed, audio.sample_rate, target_dir, output
                 )
                 suffix_note = f"合成 {Path(out_path).suffix.lstrip('.').upper()}"
             else:
                 out_path = _write_audio_result(
                     path, processed, audio.sample_rate, audio.subtype,
-                    output_dir, output,
+                    target_dir, output,
                 )
                 suffix_note = Path(out_path).suffix.lstrip(".").upper()
 

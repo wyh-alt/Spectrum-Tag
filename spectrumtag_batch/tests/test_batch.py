@@ -22,6 +22,7 @@ from ..batch import (
     ItemStatus,
     TextMode,
     collect_files,
+    collect_sources,
     run_batch,
 )
 from ..core.params import (
@@ -105,6 +106,68 @@ def check_collect_files(tmp: str) -> bool:
     print(f"[1] 文件收集                找到 = {names}  去重后 = {len(deduped)}  "
           f"单文件过滤 = {single_rejected}  混合拖入只收音频 = {mixed_ok}"
           f"  ->  {'通过' if ok else '失败'}")
+    return ok
+
+
+def check_output_hierarchy(tmp: str) -> bool:
+    """输出保留输入时的文件夹名与层级。
+
+    拖入文件夹就在输出目录里建同名文件夹、内部子目录照搬；单独拖入的文件
+    平铺在根部；两者混着拖时各按各的规矩走。两个文件夹里的同名文件正是靠
+    这套层级各归各家，这也是它真正要解决的问题。
+    """
+    src = os.path.join(tmp, "hier_src")
+    album = os.path.join(src, "Album")
+    other = os.path.join(src, "Album2")
+    deep = os.path.join(album, "CD1", "Live")
+    os.makedirs(deep, exist_ok=True)
+    os.makedirs(other, exist_ok=True)
+    out = os.path.join(tmp, "out_hier")
+
+    _write_test_wav(os.path.join(album, "top.wav"), 1.0, 44100, 1)
+    _write_test_wav(os.path.join(deep, "deep.wav"), 1.0, 44100, 1)
+    _write_test_wav(os.path.join(other, "top.wav"), 1.0, 44100, 1)
+    single = os.path.join(src, "single.wav")
+    _write_test_wav(single, 1.0, 44100, 1)
+
+    sources = collect_sources([album, other, single])
+    layout = sorted(
+        (os.path.relpath(s.path, src), s.relative_dir) for s in sources
+    )
+    want_layout = sorted([
+        (os.path.join("Album", "CD1", "Live", "deep.wav"),
+         os.path.join("Album", "CD1", "Live")),
+        (os.path.join("Album", "top.wav"), "Album"),
+        (os.path.join("Album2", "top.wav"), "Album2"),
+        ("single.wav", ""),
+    ])
+    # 老接口仍要与之一致 —— 界面之外还有调用方按路径列表用
+    legacy_ok = collect_files([album, other, single]) == [s.path for s in sources]
+
+    result = run_batch(sources, _make_job(), out)
+    produced = sorted(
+        os.path.relpath(it.output_path, out)
+        for it in result.items if it.status is ItemStatus.DONE
+    )
+    want_files = sorted([
+        os.path.join("Album", "top.wav"),
+        os.path.join("Album", "CD1", "Live", "deep.wav"),
+        os.path.join("Album2", "top.wav"),
+        "single.wav",
+    ])
+
+    ok = (
+        layout == want_layout
+        and legacy_ok
+        and result.succeeded == 4
+        and produced == want_files
+    )
+    print(f"[15] 输出层级                规划 = {[d for _, d in layout]}  "
+          f"实得 {len(produced)} 个文件  与旧接口一致 = {legacy_ok}"
+          f"  ->  {'通过' if ok else '失败'}")
+    if not ok:
+        print(f"     期望 {want_files}")
+        print(f"     实得 {produced}")
     return ok
 
 
@@ -649,6 +712,7 @@ def main() -> int:
     try:
         results = [
             check_collect_files(tmp),
+            check_output_hierarchy(tmp),
             check_batch_audio_only(tmp),
             check_watermark_actually_embedded(tmp),
             check_text_pattern_locality(tmp),

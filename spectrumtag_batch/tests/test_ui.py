@@ -961,6 +961,40 @@ def main() -> int:
         QApplication.processEvents()
         check("频谱区拖放同样生效", page.file_list.count() == 2)
 
+    def step_drop_folder() -> None:
+        """拖入文件夹：列表里带上相对路径，导出时各自落回原位。"""
+        page._clear_files()  # noqa: SLF001
+        QApplication.processEvents()
+
+        album = os.path.join(workspace, "Album")
+        nested = os.path.join(album, "CD1")
+        os.makedirs(nested, exist_ok=True)
+        shutil.copy(inputs[0], os.path.join(album, "Sample_A.wav"))
+        shutil.copy(inputs[1], os.path.join(nested, "Sample_B.wav"))
+
+        page._add_paths([album, inputs[0]])  # noqa: SLF001
+        QApplication.processEvents()
+
+        names = [
+            page.file_list.item(i).text()
+            for i in range(page.file_list.count())
+        ]
+        # 按显示名索引，免得把断言绑在遍历顺序上
+        layout = {s.display_name: s.relative_dir for s in page._files}  # noqa: SLF001
+        album_top = os.path.join("Album", "Sample_A.wav")
+        album_deep = os.path.join("Album", "CD1", "Sample_B.wav")
+
+        check("文件夹与单文件混拖后共 3 项", page.file_list.count() == 3)
+        check("文件夹内的文件带相对路径",
+              album_top in names and album_deep in names)
+        check("单独拖入的文件仍显示主名", "Sample_A.wav" in names)
+        check("落点规划正确",
+              layout == {
+                  album_top: "Album",
+                  album_deep: os.path.join("Album", "CD1"),
+                  "Sample_A.wav": "",
+              })
+
     def step_axis_units() -> None:
         """单位写在刻度上，不挂轴标签。"""
         plot = page.spectrum._plot  # noqa: SLF001
@@ -1118,6 +1152,7 @@ def main() -> int:
         step_engraving_mode, step_mode_advice, step_text_multiline_and_dblclick,
         step_drag_spinbox,
         step_sensitive_band, step_guide_bands, step_roi_handles, step_drop_files,
+        step_drop_folder,
         step_axis_units, step_window_center, step_output_options,
         step_action_buttons,
     ]
