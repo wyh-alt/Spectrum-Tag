@@ -19,7 +19,6 @@ from PyQt6.QtWidgets import (
     QGraphicsPathItem,
     QGraphicsRectItem,
     QTextEdit,
-    QVBoxLayout,
     QWidget,
 )
 from qfluentwidgets import BodyLabel
@@ -80,6 +79,13 @@ _MAX_DISPLAY_COLS = 2000
 # 印章框的最小尺寸（占整体的比例），防止拖成一条线后 DSP 无法工作
 _MIN_FREQ_SPAN = 0.005
 _MIN_TIME_SPAN_SEC = 0.01
+
+# 绘图区锁定的宽高比（宽 / 高）。窗口随用户拖成什么形状，这里始终是 16:9、
+# 居中摆放，多出来的空间留白。
+#
+# 与「保持原始水印比例」用的基准（``main_window._ASPECT_BASE_RATIO`` 的倒数）
+# 是同一个比例：图案在预览里的形状因此就是导出后的形状，不受窗口影响。
+_PLOT_ASPECT = 16.0 / 9.0
 
 # 热力图色标：黑 → 深紫 → 橙红 → 黄（与 SpectrumTag 的观感一致）。
 # 位置 + R/G/B，取值均为 0~1。
@@ -379,7 +385,6 @@ class SpectrogramView(QWidget):
     filesDropped = pyqtSignal(list)       # 拖入的本地文件路径
     patternDoubleClicked = pyqtSignal()   # 双击印章框，想改水印内容
     inlineTextChanged = pyqtSignal(str)   # 框内就地编辑时，每敲一个字都会发
-    viewResized = pyqtSignal()            # 绘图区尺寸变了（外部可能要重算时长）
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -458,9 +463,9 @@ class SpectrogramView(QWidget):
         self._hint = BodyLabel("拖入音频文件后，这里会显示整段时频图", self)
         self._hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(self._plot, 1)
+        # 刻意不用布局管理器：绘图区要在窗口里保持 16:9 并居中，直接摆几何
+        # 比让布局管理器撑满更干脆（见 _apply_plot_geometry）
+        self._plot.setParent(self)
 
         self._hint.setParent(self)
         self._hint.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
@@ -476,6 +481,8 @@ class SpectrogramView(QWidget):
             # 用的是自己那套 mouseClickEvent / mouseDragEvent 转发，双击根本
             # 到不了 item（实测调用 0 次）。所以在视口上直接拦。
             viewport.installEventFilter(self)
+
+        self._apply_plot_geometry()
 
     def _add_overlay_item(self, lut: np.ndarray) -> pg.ImageItem:
         """新建一层图案叠层（图案本体与描边各一层）。"""
@@ -594,17 +601,25 @@ class SpectrogramView(QWidget):
         self._sensitive_timer.setInterval(_SENSITIVE_HIDE_DELAY_MS)
         self._sensitive_timer.timeout.connect(self._hide_guide_bands)
 
+    def _axis_margin_px(self) -> int:
+        """坐标轴占掉的边距（左、下同宽）：刚好放得下最宽的刻度。
+
+        两处用到它：:meth:`_sync_axis_margins` 拿它设轴的宽高，
+        :meth:`_apply_plot_geometry` 拿它把绘图区的像素比例折算到实际画图的那块
+        区域上。算法必须一致，否则按 ``_plot`` 摆出来的比例会差一条边距。
+        """
+        metrics = QFontMetrics(self._tick_font)
+        # 最宽的刻度文字（"20k"）加上一点留白
+        return max(metrics.height(), metrics.horizontalAdvance("20k")) + 4
+
     def _sync_axis_margins(self) -> None:
-        """把两侧边距设成同一个值：刚好放得下最宽的刻度。
+        """把两侧边距设成同一个值。
 
         不用 ``max(left.width(), bottom.height())`` 那种"先让它们自适应再取大者"
         的做法 —— ``setWidth()`` 会把轴的 ``fixedWidth`` 锁死，之后它再也不按内容
         重新量尺寸，刻度一变宽就会被截断。这里直接算出需要的值，可预期也更稳。
         """
-        metrics = QFontMetrics(self._tick_font)
-        # 最宽的刻度文字（"20k"）加上一点留白
-        margin = max(metrics.height(), metrics.horizontalAdvance("20k")) + 4
-
+        margin = self._axis_margin_px()
         self._plot.getAxis("left").setWidth(margin)
         self._plot.getAxis("bottom").setHeight(margin)
 
@@ -793,19 +808,6 @@ class SpectrogramView(QWidget):
         if self._pattern is None or self._pattern.size == 0:
             return None
         return int(self._pattern.shape[0]), int(self._pattern.shape[1])
-
-    def viewport_aspect(self) -> float:
-        """频谱绘图区的高宽比（高 / 宽）。
-
-        「保持原始水印比例」用它把频率跨度折成时间跨度：图案在频谱图上
-        看起来不变形，靠的就是这个比例。
-        """
-        rect = self._plot.getViewBox().geometry()
-        width, height = float(rect.width()), float(rect.height())
-        if width <= 1.0 or height <= 1.0:      # 还没布局完，退回整个视口
-            viewport = self._plot.viewport()
-            width, height = float(viewport.width()), float(viewport.height())
-        return max(1e-3, height / max(1.0, width))
 
     def _update_pattern_rect(self) -> None:
         """让图案叠层跟着印章框走。
@@ -1091,13 +1093,42 @@ class SpectrogramView(QWidget):
 
     # ---------------------------------------------------------------- 布局
 
+    def _apply_plot_geometry(self) -> None:
+        """把绘图区摆成居中的 16:9 矩形。
+
+        窗口给的空间比 16:9 更宽时以高度为准（两侧留白），更高时以宽度为准
+        （上下留白）。图案在预览里的形状因此只由窗口尺寸决定"多大"，不由它决定
+        "多扁"。
+
+        比例量的是 **ViewBox**（真正画频谱和图案的那块），不是整个 ``_plot`` ——
+        左边和下边各有一条坐标轴边距，按 ``_plot`` 算的话，窗口越小这条边距占比
+        越大，图案在屏幕上仍会跟着变形。
+
+        提示文字跟着绘图区走：它只在没有音频时露面，摆在留白里会显得像另一个面板。
+        """
+        w, h = self.width(), self.height()
+        if w <= 0 or h <= 0:
+            return
+        margin = self._axis_margin_px()
+        avail_w = max(1, w - margin)
+        avail_h = max(1, h - margin)
+        if avail_w / avail_h > _PLOT_ASPECT:
+            view_w = max(1, round(avail_h * _PLOT_ASPECT))
+            view_h = avail_h
+        else:
+            view_w = avail_w
+            view_h = max(1, round(avail_w / _PLOT_ASPECT))
+        plot_w = view_w + margin
+        plot_h = view_h + margin
+        rect = QRect((w - plot_w) // 2, (h - plot_h) // 2, plot_w, plot_h)
+        self._plot.setGeometry(rect)
+        self._hint.setGeometry(rect)
+
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
-        self._hint.setGeometry(self.rect())
+        self._apply_plot_geometry()
         self._position_inline_edit()
         self._queue_axis_margin_sync()
-        # 视口高宽比变了，「保持原始水印比例」算出来的时长要跟着重算
-        self.viewResized.emit()
 
     # ------------------------------------------------------------ 就地编辑
 

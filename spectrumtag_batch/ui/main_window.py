@@ -111,9 +111,13 @@ ADVICE_OVERLAP_RATIO = 0.5
 # 拖动停下多久之后才给建议 —— 拖的过程中弹模态框会打断操作，而且会连弹好几次
 _ADVICE_DELAY_MS = 600
 
-# 窗口尺寸变化后等多久再重算「保持原始水印比例」的时长。
-# 拖窗口边框会连发几十次 resize，逐次重算纯属浪费。
-_ASPECT_DELAY_MS = 150
+# 「保持原始水印比例」的基准绘图区高宽比（高 / 宽），即 16:9。
+#
+# 刻意不取窗口里绘图区的实际比例：窗口多大取决于用户当下的屏幕，不该影响印
+# 出来的东西 —— 早先读的是实时比例，同一份文件在两台电脑上会算出不同的时长。
+# 基准写死后，时长只由图案长宽比与频率跨度决定。代价是窗口不是 16:9 时，预览
+# 里的图案看着会有一点拉伸，那只是屏幕上的显示。
+_ASPECT_BASE_RATIO = 9.0 / 16.0
 
 # 「保持原始水印比例」算出来的时长下限（占音频总长的比例）——
 # 频率框压得极扁时比例会趋近 0，留一点余量免得印章短到印不出来
@@ -260,12 +264,6 @@ class BatchPage(QWidget):
         self._advice_timer.timeout.connect(self._maybe_advise_mode)
 
         self.setAcceptDrops(True)       # 整个页面都能接文件，不只是输入框
-
-        # 「保持原始水印比例」的时长重算去抖：视口比例变了才需要重来
-        self._aspect_timer = QTimer(self)
-        self._aspect_timer.setSingleShot(True)
-        self._aspect_timer.setInterval(_ASPECT_DELAY_MS)
-        self._aspect_timer.timeout.connect(self._apply_aspect_duration)
 
         self._build_ui()
         self._connect_signals()
@@ -453,6 +451,7 @@ class BatchPage(QWidget):
         self.keep_aspect_check.setChecked(True)
         self.keep_aspect_check.setToolTip(
             "时长按图案的长宽比自动调节，图案不被拉伸变形。\n"
+            "基准比例固定为 16:9，改窗口大小不会改变印刷结果。\n"
             "关掉之后时长重新可以手调，代价是图案会被拉伸铺满整个框。"
         )
 
@@ -656,7 +655,6 @@ class BatchPage(QWidget):
         self.mode_combo.currentIndexChanged.connect(self._on_position_mode_changed)
 
         self.spectrum.regionChanged.connect(self._on_region_changed)
-        self.spectrum.viewResized.connect(self._aspect_timer.start)
         self.spectrum.filesDropped.connect(self._add_paths)
         self.spectrum.patternDoubleClicked.connect(self._on_pattern_double_clicked)
         self.spectrum.inlineTextChanged.connect(self._on_inline_text_changed)
@@ -758,10 +756,12 @@ class BatchPage(QWidget):
         比例 —— 让框在频谱图上的像素宽高比等于图案自身的宽高比，看起来才跟
         原图一致。频率跨度由用户定死，时长于是被唯一确定：
 
-            时长/总时长 = (图案宽/图案高) × 频率跨度(归一化) × (绘图区高/宽)
+            时长/总时长 = (图案宽/图案高) × 频率跨度(归一化) × 9/16
 
-        绘图区比例参与其中，所以窗口大小一变就得重算 —— 这正是"所见即所得"
-        该有的代价：预览里看到的形状，就是导出后频谱上的形状。
+        末尾的比例是**写死的基准绘图区高宽比**（16:9，见
+        :data:`_ASPECT_BASE_RATIO`）。早先这里读的是窗口绘图区的实时比例，
+        于是同一份文件在两台电脑上会算出不同的时长 —— 窗口多大不该影响印出来
+        的东西。代价仅是窗口不是 16:9 时预览看着略有拉伸，导出结果不受影响。
 
         未勾选、没有音频、图案还没渲染出来，或已经在应用途中时什么都不做。
         """
@@ -781,7 +781,7 @@ class BatchPage(QWidget):
         if height <= 0 or width <= 0 or span <= 0.0:
             return
 
-        norm = (width / height) * span * self.spectrum.viewport_aspect()
+        norm = (width / height) * span * _ASPECT_BASE_RATIO
         norm = max(_MIN_ASPECT_DURATION, min(1.0, norm))
 
         total = self._preview_total_seconds()
@@ -1218,7 +1218,6 @@ class BatchPage(QWidget):
         self.spectrum.set_time_range(start, dur)
 
         # 换了素材：时长按新音频重新校准（保持比例时它就是新总长的比例值）
-        self._aspect_timer.stop()        # 载入过程里的 resize 通知已经过时了
         self._apply_aspect_duration()
 
     def _current_freq_norm(self) -> tuple[float, float]:

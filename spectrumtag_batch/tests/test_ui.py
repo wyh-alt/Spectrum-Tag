@@ -352,10 +352,13 @@ def main() -> int:
         check("保持比例默认勾选", page.keep_aspect_check.isChecked())
         check("勾选时时长框锁定", not page.duration_spin.isEnabled())
 
+        from ..ui.main_window import _ASPECT_BASE_RATIO
+
         total = view.duration_sec()
         height, width = view.pattern_shape()
         low, high = page._current_freq_norm()            # noqa: SLF001
-        expected = (width / height) * (high - low) * view.viewport_aspect()
+        check("基准比例固定为 9/16", abs(_ASPECT_BASE_RATIO - 9 / 16) < 1e-12)
+        expected = (width / height) * (high - low) * _ASPECT_BASE_RATIO
         actual = view.time_range_sec()[1] / total
         check(f"时长 = 图案比例算出的值（{actual:.3f} / 期望 {expected:.3f}）",
               abs(actual - expected) < 0.01)
@@ -396,6 +399,42 @@ def main() -> int:
               abs(seconds - expected * total) < 0.05)
         page.mode_combo.setCurrentIndex(0)
         QApplication.processEvents()
+
+    def step_keep_aspect_window() -> None:
+        """改窗口大小，既不该动印出来的时长，也不该让预览里的图案变形。
+
+        早先时长读的是绘图区的实时比例，于是两台电脑（窗口不一样大）印出的
+        时长不一致 —— 同一份素材、同一套参数，成品却对不上。基准写死 9/16、
+        绘图区锁成 16:9 之后，这两条都不该再被窗口拽回去。
+        """
+        view = page.spectrum
+        check("仍在保持比例状态", page.keep_aspect_check.isChecked())
+
+        saved = (window.width(), window.height())
+        box = view._plot.getViewBox().geometry()          # noqa: SLF001
+        ratio_before = box.height() / max(1.0, box.width())
+        before = view.time_range_sec()[1]
+
+        window.resize(1100, 950)      # 明显更"方"的窗口
+        QApplication.processEvents()
+        QTest.qWait(400)              # 比原先 150ms 的去抖还久：联动若被加回来，这里必露馅
+
+        box = view._plot.getViewBox().geometry()          # noqa: SLF001
+        ratio_after = box.height() / max(1.0, box.width())
+        after = view.time_range_sec()[1]
+        # 先证明窗口真的变了形，否则后面两条可能因为 resize 没生效而白通过
+        check(f"窗口确实变了形（{saved[0]}x{saved[1]} -> 1100x950）",
+              (window.width(), window.height()) == (1100, 950))
+        check(f"绘图区锁在 16:9（{ratio_before:.3f} / {ratio_after:.3f}）",
+              abs(ratio_before - 9 / 16) < 0.01 and abs(ratio_after - 9 / 16) < 0.01)
+        check(f"改窗口后时长不变（{before:.3f}s -> {after:.3f}s）",
+              abs(after - before) < 1e-9)
+
+        window.resize(*saved)
+        QApplication.processEvents()
+        QTest.qWait(200)
+        check("窗口还原后时长仍不变",
+              abs(view.time_range_sec()[1] - before) < 1e-9)
 
     def step_loop_consistency() -> None:
         """预览影子必须和 DSP 实际印刷的区间对得上。
@@ -1145,7 +1184,7 @@ def main() -> int:
 
     steps = [
         step_empty, step_add_files, step_after_preview, step_image_mode,
-        step_loop_on, step_outline, step_keep_aspect,
+        step_loop_on, step_outline, step_keep_aspect, step_keep_aspect_window,
         step_help_page, step_help_snap, step_collect_job,
         step_loop_consistency, step_region_bounds, step_zoom_behavior,
         step_pattern_overlay,
