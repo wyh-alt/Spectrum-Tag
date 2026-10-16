@@ -26,6 +26,7 @@ from ..core.params import (
     EngraveMode,
     Interval,
     LoopSpec,
+    MAX_MASK_COLS,
     PlacementSpec,
     PositionMode,
     outline_boost_for,
@@ -307,6 +308,34 @@ def check_truncated_stamp_not_squashed() -> bool:
     return ok
 
 
+def check_truncated_stamp_cols() -> bool:
+    """末尾截断不该把整批印章的列数一起拖下水。
+
+    列号按 ``mapping_span`` 推进（见上一条），列数必须跟它同一个基准 —— 按实际
+    长度算的话，末尾那零点几秒会把所有印章一起糊成几个台阶。
+
+    用例取自实测：84.335 秒的素材、印章占 19%、间隔 5 秒时，末尾只剩 0.24 秒。
+    """
+    from ..core.render import choose_num_cols
+
+    placement = PlacementSpec(
+        start=0.0, duration=0.190, position_mode=PositionMode.RELATIVE
+    )
+    loop = LoopSpec(enabled=True, interval_sec=5.0)
+    intervals = resolve_intervals(placement, loop, 84.335)
+
+    tail = intervals[-1]
+    truncated = tail.duration < 0.25 * tail.mapping_span     # 前提确实成立
+    expected = min(round(tail.mapping_span * SR / (FFT_SIZE // 4)), MAX_MASK_COLS)
+    cols = choose_num_cols(intervals, SR, FFT_SIZE)
+
+    ok = truncated and cols == expected and cols > 100
+    print(f"[7b] 截断时的列数              末尾 {tail.duration:.2f}s / 名义 "
+          f"{tail.mapping_span:.2f}s  ->  {cols} 列（期望 {expected}）"
+          f"  ->  {'通过' if ok else '失败'}")
+    return ok
+
+
 def check_outline_peak_valley() -> bool:
     """图案描边：本体削弱时外圈被抬起来，本体注入时外圈被压下去 —— 峰谷成对。
 
@@ -429,6 +458,7 @@ def main() -> int:
         check_loop_intervals(),
         check_draw_mode(),
         check_truncated_stamp_not_squashed(),
+        check_truncated_stamp_cols(),
         check_mask_rasterization(),
         check_outline_peak_valley(),
         check_outline_boost_range(),

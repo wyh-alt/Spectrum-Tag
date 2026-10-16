@@ -7,8 +7,9 @@
 3. 兜住"区间落在音频之外"这类空操作。
 
 掩码列数的选择依据：一列对应一个 STFT 帧时时间分辨率最高，再多的列也用不上
-（同一列会被相邻帧重复取用）。所以取 ``时长 / 帧跳距``，并夹在 [4, 4096] 内 ——
-上界与 SpectrumTag 的 ``computeMaskCols`` 保持一致。
+（同一列会被相邻帧重复取用）。所以取 ``印章跨度 / 帧跳距``，并夹在 [4, 4096]
+内 —— 上界与 SpectrumTag 的 ``computeMaskCols`` 保持一致。跨度而非实际长度，
+理由见 :func:`choose_num_cols`。
 """
 
 from __future__ import annotations
@@ -65,11 +66,18 @@ def choose_num_cols(
     sample_rate: float,
     fft_size: int,
 ) -> int:
-    """按最短区间决定掩码列数，保证每个区间的图案都不丢细节。"""
+    """按最短的印章跨度决定掩码列数，保证每个区间的图案都不丢细节。
+
+    取 ``mapping_span`` 而不是实际长度：列号的推进本来就走这个跨度（见
+    :func:`~.dsp._assign_columns`），列数必须跟它同一个基准。末尾那次印章被
+    音频截断后实际只剩零点几秒，按实际长度算会把整批印章的分辨率一起拖到
+    ``MIN_MASK_COLS``，图案糊成几个台阶；按跨度算，被截断的那段自然只用到它
+    该有的列数，既不多占也不缺。
+    """
     if not intervals:
         return MIN_MASK_COLS
     hop = max(1, fft_size // 4)
-    shortest = min(iv.duration for iv in intervals)
+    shortest = min(iv.mapping_span for iv in intervals)
     frames = shortest * sample_rate / hop
     return int(np.clip(round(frames), MIN_MASK_COLS, MAX_MASK_COLS))
 
